@@ -19,6 +19,10 @@ PYTHON="${PYTHON:-python3}"
 DC="$PYTHON $SCRIPT_DIR/dream_cycle.py"
 DI="$PYTHON $SCRIPT_DIR/git_diff_intel.py"
 
+# 停用 ollama 雲端功能與瀏覽器彈窗
+export OLLAMA_NO_CLOUD=1
+export BROWSER=""
+
 echo_header() {
     echo ""
     echo "══════════════════════════════════════════"

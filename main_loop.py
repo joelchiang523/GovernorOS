@@ -537,6 +537,7 @@ def run_aider(
     cmd = (
         f'"{AIDER_BIN}" --yes-always --no-auto-commits '
         f'--no-detect-urls --no-auto-lint --map-tokens 0 '
+        f'--no-browser --no-show-model-warnings '
         f'--model {model} '
         f'{file_args} '
         f'--message "{message}"'

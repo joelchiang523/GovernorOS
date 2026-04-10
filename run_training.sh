@@ -16,6 +16,10 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 停用 ollama 雲端功能與瀏覽器彈窗
+export OLLAMA_NO_CLOUD=1
+export BROWSER=""
 PYTHON="${PYTHON:-python3}"
 SUITE="$SCRIPT_DIR/benchmarks/coding_suite_v1.json"
 RESET_SCRIPT="$SCRIPT_DIR/benchmarks/reset_tasks.sh"
