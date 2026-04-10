@@ -89,7 +89,9 @@ class LoopStateMachine:
         self.state             = "continue"
 
     def update(self, harness_pass: bool, task_complete: bool = False) -> str:
-        if task_complete:
+        # task_complete 只有在 harness 也通過時才真正停止
+        # 若模型宣告完成但 harness 仍失敗，繼續迭代
+        if task_complete and harness_pass:
             self.state = "stop"
             return self.state
 
@@ -189,6 +191,7 @@ def run_aider(
 
     cmd = (
         f'"{AIDER_BIN}" --yes-always --no-auto-commits '
+        f'--no-detect-urls --no-auto-lint --map-tokens 0 '
         f'--model {model} '
         f'{file_args} '
         f'--message "{message}"'
@@ -207,7 +210,8 @@ def run_aider(
         lines = output.strip().splitlines()
         print("\n".join(lines[-10:]))
 
-    task_complete = "TASK_COMPLETE" in output
+    # 只有當 TASK_COMPLETE 獨立成行時才視為完成（避免把任務描述中的字串誤判）
+    task_complete = bool(re.search(r'^\s*TASK_COMPLETE\s*$', output, re.MULTILINE))
     return output, task_complete
 
 
