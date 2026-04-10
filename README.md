@@ -1,6 +1,21 @@
 # GovernorOS
+> 本地自治智能體作業系統 — 五層記憶 · 雙模型治理 · 長時程自我改善
 
-**A self-learning AI programming assistant with a 5-layer memory architecture.**
+### A Memory-Governed Long-Horizon Autonomous Agent OS
+
+GovernorOS is an autonomous agent framework designed for stable multi-iteration coding and research workflows.
+
+Built with:
+- MemPalace working memory
+- DreamCycle memory lifecycle
+- Governor / Researcher dual-model routing
+- rollback safety
+- Git Diff Intelligence
+- runtime governance
+
+Optimized for local-first deployments with Ollama, Ubuntu, and RTX-class GPUs.
+
+---
 
 GovernorOS wraps [Aider](https://aider.chat) with a persistent memory system that learns from
 every coding session. It uses a dual-model design (Governor for judgement, Researcher for

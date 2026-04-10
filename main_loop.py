@@ -39,7 +39,7 @@ import requests
 # ── aider 執行檔路徑（優先 PATH，其次 conda 環境）────────────
 AIDER_BIN: str = (
     shutil.which("aider")
-    or "/mnt/ai_data/AI/conda_envs/qwen25/bin/aider"
+    or os.path.expanduser("~/.local/bin/aider")
 )
 
 # ── Aider subprocess 超時（本地大模型生成較慢）────────────────
