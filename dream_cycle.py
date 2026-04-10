@@ -67,8 +67,8 @@ OLLAMA_MODEL = OLLAMA_MODEL_GOVERNOR
 
 # 門檻設定
 THRESHOLDS = {
-    "episode_min_score":      6,      # L3 進驗證池最低分
-    "l3_to_l4_min_count":     3,      # 同類規律出現幾次才升 L4
+    "episode_min_score":      2,      # L3 進驗證池最低分（調低以允許失敗 episode 流入 L4）
+    "l3_to_l4_min_count":     2,      # 同類規律出現幾次才升 L4（2 次即可萃取規律）
     "l4_to_l5_min_conf":      0.75,   # L4 升 L5 最低 confidence
     "wake_l4_min_conf":       0.70,   # 注入 PROMPT 的 L4 最低 confidence
     "wake_l5_min_conf":       0.75,   # 注入 PROMPT 的 L5 最低 confidence
@@ -525,6 +525,20 @@ def episode_importance_score(
         score += 2
         reasons.append("失敗事件（學習價值高）")
 
+    # 任務分解能力相關（含多步驟、多檔案）
+    decomp_keywords = ["step", "phase", "stage", "split", "分解", "分步", "子任務",
+                       "parse", "validate", "sort", "search", "graph", "cache"]
+    if any(kw in task.lower() for kw in decomp_keywords):
+        score += 2
+        reasons.append("任務分解/演算法相關")
+
+    # 寫程式能力相關（含實作、修正、測試）
+    coding_keywords = ["implement", "fix", "修正", "實作", "bug", "error",
+                       "pytest", "harness", "test", "solution"]
+    if any(kw in task.lower() for kw in coding_keywords):
+        score += 1
+        reasons.append("coding 任務")
+
     priority = "high" if score >= 6 else ("normal" if score >= 3 else "low")
     pool = "validated" if score >= THRESHOLDS["episode_min_score"] else "candidate"
 
@@ -834,7 +848,8 @@ def group_similar_episodes(episodes: list) -> dict[str, list]:
         if matched:
             groups[matched].append(ep)
         else:
-            groups[" ".join(list(task_words)[:5])].append(ep)
+            key = " ".join(sorted(task_words)[:5])
+            groups.setdefault(key, []).append(ep)
     return groups
 
 
