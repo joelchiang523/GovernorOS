@@ -1,0 +1,86 @@
+{
+  "name": "coding_suite_v2",
+  "description": "10 題 Python coding 訓練：演算法、資料結構、任務分解",
+  "cases": [
+    {
+      "id": "fix_sort",
+      "task": "修正 solution.py 的 bubble_sort：內層迴圈 range(n-i) 改為 range(n-i-1)，避免 IndexError。完成後輸出 TASK_COMPLETE",
+      "harness": "python3 -m pytest tests/test_sort.py -q",
+      "work_dir": "${BENCH_TASKS}/fix_sort",
+      "aider_files": ["solution.py"], "max_iter": 6, "score_pattern": "passed",
+      "aider_model": "ollama/qwen2.5-coder:14b"
+    },
+    {
+      "id": "fix_cache",
+      "task": "修正 LRUCache.get()：取值後需 move_to_end(key) 更新順序。完成後輸出 TASK_COMPLETE",
+      "harness": "python3 -m pytest tests/test_cache.py -q",
+      "work_dir": "${BENCH_TASKS}/fix_cache",
+      "aider_files": ["solution.py"], "max_iter": 6, "score_pattern": "passed",
+      "aider_model": "ollama/qwen2.5-coder:14b"
+    },
+    {
+      "id": "fix_parser",
+      "task": "修正 parse_csv_line()：用 state machine 或 csv 模組支援 quoted fields。完成後輸出 TASK_COMPLETE",
+      "harness": "python3 -m pytest tests/test_parser.py -q",
+      "work_dir": "${BENCH_TASKS}/fix_parser",
+      "aider_files": ["solution.py"], "max_iter": 8, "score_pattern": "passed",
+      "aider_model": "ollama/qwen2.5-coder:14b"
+    },
+    {
+      "id": "fix_graph",
+      "task": "實作 topological_sort(graph)：DAG 拓撲排序，用 DFS post-order 或 Kahn 演算法。完成後輸出 TASK_COMPLETE",
+      "harness": "python3 -m pytest tests/test_graph.py -q",
+      "work_dir": "${BENCH_TASKS}/fix_graph",
+      "aider_files": ["solution.py"], "max_iter": 6, "score_pattern": "passed",
+      "aider_model": "ollama/qwen2.5-coder:14b"
+    },
+    {
+      "id": "fix_validator",
+      "task": "修正三個驗證函式：email 用正則、password 加大小寫/數字規則、phone 用 ^09\\d{8}$。完成後輸出 TASK_COMPLETE",
+      "harness": "python3 -m pytest tests/test_validator.py -q",
+      "work_dir": "${BENCH_TASKS}/fix_validator",
+      "aider_files": ["solution.py"], "max_iter": 8, "score_pattern": "passed",
+      "aider_model": "ollama/qwen2.5-coder:14b"
+    },
+    {
+      "id": "tree_ops",
+      "task": "修正 solution.py：(1) inorder() 改為正確中序遍歷（左→根→右）；(2) 實作 max_depth() 計算樹的最大深度（遞迴）。完成後輸出 TASK_COMPLETE",
+      "harness": "python3 -m pytest tests/test_tree.py -q",
+      "work_dir": "${BENCH_TASKS}/tree_ops",
+      "aider_files": ["solution.py"], "max_iter": 6, "score_pattern": "passed",
+      "aider_model": "ollama/qwen2.5-coder:14b"
+    },
+    {
+      "id": "dp_problems",
+      "task": "修正 solution.py 三個 DP 問題：(1) coin_change 改用 DP（greedy 無法得最優解）；(2) 實作 longest_common_subsequence；(3) 實作 0/1 knapsack。完成後輸出 TASK_COMPLETE",
+      "harness": "python3 -m pytest tests/test_dp.py -q",
+      "work_dir": "${BENCH_TASKS}/dp_problems",
+      "aider_files": ["solution.py"], "max_iter": 10, "score_pattern": "passed",
+      "aider_model": "ollama/qwen2.5-coder:14b"
+    },
+    {
+      "id": "string_ops",
+      "task": "修正 solution.py：(1) is_palindrome 需忽略非字母數字及大小寫；(2) 實作 group_anagrams 分組；(3) 實作 compress_string RLE 壓縮。完成後輸出 TASK_COMPLETE",
+      "harness": "python3 -m pytest tests/test_string.py -q",
+      "work_dir": "${BENCH_TASKS}/string_ops",
+      "aider_files": ["solution.py"], "max_iter": 8, "score_pattern": "passed",
+      "aider_model": "ollama/qwen2.5-coder:14b"
+    },
+    {
+      "id": "stack_queue",
+      "task": "修正 solution.py：(1) is_valid_brackets 需檢查配對順序（用 stack）；(2) 實作 eval_rpn 逆波蘭計算；(3) 修正 MinStack.get_min 為 O(1)（用輔助 stack）。完成後輸出 TASK_COMPLETE",
+      "harness": "python3 -m pytest tests/test_stack.py -q",
+      "work_dir": "${BENCH_TASKS}/stack_queue",
+      "aider_files": ["solution.py"], "max_iter": 8, "score_pattern": "passed",
+      "aider_model": "ollama/qwen2.5-coder:14b"
+    },
+    {
+      "id": "task_decomp",
+      "task": "修正 solution.py 文字分析器：(1) tokenize 需轉小寫；(2) count_sentences 連續標點只算一句；(3) top_words 需套用 stopwords 過濾。完成後輸出 TASK_COMPLETE",
+      "harness": "python3 -m pytest tests/test_decomp.py -q",
+      "work_dir": "${BENCH_TASKS}/task_decomp",
+      "aider_files": ["solution.py"], "max_iter": 8, "score_pattern": "passed",
+      "aider_model": "ollama/qwen2.5-coder:14b"
+    }
+  ]
+}

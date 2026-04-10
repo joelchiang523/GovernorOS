@@ -25,6 +25,16 @@ WHITELIST=(
   "git_diff_intel.py"
   "startup.sh"
   "ARCHITECTURE.md"
+  "task_intake.py"
+  "mempalace.py"
+  "run_training.sh"
+  "benchmark_runner.py"
+  "continuous_training_runner.py"
+  "benchmarks/coding_suite_v1.json"
+  "benchmarks/coding_suite_v2.json"
+  "benchmarks/compare_runs.py"
+  "benchmarks/reset_tasks.sh"
+  "auto_train.sh"
 )
 
 # ── 參數解析 ────────────────────────────────────────────────────
