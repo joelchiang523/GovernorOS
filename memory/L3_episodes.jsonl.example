@@ -1,0 +1,1 @@
+{"id": "ep_001", "time": "2024-01-01T00:00:00", "task": "Example task description", "status": 0, "diff_summary": "files=main.py lines=42", "harness_delta": 1.0, "score": 8, "reasons": ["新方法首次成功", "score >= 6 → validated"], "priority": "high", "pool": "validated"}

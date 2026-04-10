@@ -1,0 +1,36 @@
+# ── Private memory data (DO NOT commit) ──────────────────────
+memory/L1_buffer.txt
+memory/L2_working.md
+memory/L3_episodes.jsonl
+memory/L4_knowledge.json
+memory/L5_strategies.json
+memory/git_diff_records.jsonl
+
+# ── Execution logs & runtime state ───────────────────────────
+*.log
+run.log
+Code/*/run.log
+Code/**/run.log
+
+# ── Aider runtime files ───────────────────────────────────────
+.aider*
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v4/
+
+# ── Claude Code local config ──────────────────────────────────
+.claude/
+
+# ── Python ───────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# ── OS ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
