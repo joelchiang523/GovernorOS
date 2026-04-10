@@ -2,7 +2,7 @@
 # startup.sh — AI System v3.0 時間排程腳本
 #
 # 用法：
-#   ./startup.sh morning   → 09:00 啟動（decay + wake）
+#   ./startup.sh morning   → 09:00 啟動（decay + score-strategies + wake）
 #   ./startup.sh evening   → 15:00-16:00 盤後整合（sleep + deep + decay）
 #   ./startup.sh status    → 顯示記憶系統狀態
 #   ./startup.sh init      → 第一次使用：初始化所有記憶檔案
@@ -34,15 +34,19 @@ cmd_morning() {
     echo_header "Morning Startup"
 
     echo ""
-    echo "[1/3] Memory Decay Check..."
+    echo "[1/4] Memory Decay Check..."
     $DC --decay
 
     echo ""
-    echo "[2/3] Conflict Check（含 decay wake）..."
+    echo "[2/4] Strategy Effectiveness Scoring..."
+    $DC --score-strategies
+
+    echo ""
+    echo "[3/4] Conflict Check（含 decay wake）..."
     $DC --wake
 
     echo ""
-    echo "[3/3] 系統狀態..."
+    echo "[4/4] 系統狀態..."
     $DC --status
 
     echo ""
@@ -145,7 +149,7 @@ case "$CMD" in
         echo "用法：./startup.sh [morning|evening|init|status|analyze]"
         echo ""
         echo "  init     → 第一次使用，初始化記憶目錄"
-        echo "  morning  → 09:00 啟動（decay check + wake 注入）"
+        echo "  morning  → 09:00 啟動（decay + score-strategies + wake 注入）"
         echo "  evening  → 15:00 盤後整合（sleep + deep + decay）"
         echo "  status   → 顯示 L3/L4/L5 + DiffIntel 狀態"
         echo "  analyze  → 手動分析 Git Diff 模式"

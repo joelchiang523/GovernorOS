@@ -43,7 +43,12 @@ PATHS = {
     "L3": MEMORY_DIR / "L3_episodes.jsonl",
     "L4": MEMORY_DIR / "L4_knowledge.json",
     "L5": MEMORY_DIR / "L5_strategies.json",
+    "WAKE_HISTORY": MEMORY_DIR / "wake_history.jsonl",
+    "STRATEGY_HISTORY": MEMORY_DIR / "strategy_history.jsonl",
+    "BENCHMARK_HISTORY": MEMORY_DIR / "benchmark_history.jsonl",
 }
+EXPORT_DIR = BASE_DIR / "exports"
+TRACE_ROOT = MEMORY_DIR / "traces"
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
@@ -55,7 +60,7 @@ OLLAMA_MODEL_GOVERNOR   = os.environ.get(
 # Researcher：生成 / 萃取 / 草稿 / Bridge（高服從、快速產出）
 OLLAMA_MODEL_RESEARCHER = os.environ.get(
     "OLLAMA_MODEL_RESEARCHER",
-    "prutser/gemma-4-26B-A4B-it-ara-abliterated:q5_k_m",
+    "qwen2.5:7b",
 )
 # 向後相容：ollama_call() 預設值沿用 Governor
 OLLAMA_MODEL = OLLAMA_MODEL_GOVERNOR
@@ -75,6 +80,9 @@ THRESHOLDS = {
     "conflict_overlap":       0.50,   # condition 重疊度超過此值視為衝突
     "max_wake_tokens":        500,    # 注入內容最大字數
     "decay_warning_days":     7,      # decay_timer 剩餘天數警告
+    "strategy_promote_ratio": 0.70,   # strategy scorer 提升門檻
+    "strategy_demote_ratio":  0.45,   # strategy scorer 降權門檻
+    "strategy_min_uses":      3,      # strategy scorer 最低樣本數
 }
 
 # ─────────────────────────────────────────────
@@ -200,6 +208,13 @@ def append_jsonl(path: Path, record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def write_jsonl(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def read_md(path: Path) -> str:
     if not path.exists():
         return ""
@@ -226,6 +241,215 @@ def gen_id(prefix: str, path: Path) -> str:
     return f"{prefix}_{len(records) + 1:03d}"
 
 
+def sanitize_text(text: str, limit: int = 1500) -> str:
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", " ", text).strip()
+    return compact[:limit]
+
+
+def infer_repo_type(framework: str, files: list[str], task: str) -> str:
+    if framework in {"pygame", "godot", "unity"}:
+        return "game"
+    blob = " ".join(files).lower() + " " + task.lower()
+    if any(token in blob for token in ["pygame", "godot", "unity", ".gd", "project.godot"]):
+        return "game"
+    return "general"
+
+
+def infer_framework(files: list[str], task: str, harness_cmd: str, work_dir: str) -> str:
+    blob = " ".join(files).lower()
+    task_blob = task.lower()
+    wd = work_dir.lower()
+    hc = harness_cmd.lower()
+    if "pygame" in blob or "pygame" in task_blob:
+        return "pygame"
+    if ".gd" in blob or "project.godot" in blob or "godot" in task_blob or "godot" in wd:
+        return "godot"
+    if ".cs" in blob and ("assets/" in wd or "projectsettings" in wd or "unity" in task_blob):
+        return "unity"
+    if "pytest" in hc and any(path.endswith(".py") for path in files):
+        return "python"
+    if any(path.endswith((".tsx", ".jsx")) for path in files):
+        return "react"
+    return "generic"
+
+
+def infer_language(files: list[str]) -> str:
+    suffixes = {Path(path).suffix.lower() for path in files if Path(path).suffix}
+    if ".py" in suffixes:
+        return "python"
+    if ".gd" in suffixes:
+        return "gdscript"
+    if ".cs" in suffixes:
+        return "csharp"
+    if ".ts" in suffixes or ".tsx" in suffixes:
+        return "typescript"
+    if ".js" in suffixes or ".jsx" in suffixes:
+        return "javascript"
+    return "unknown"
+
+
+def infer_test_scope(harness_cmd: str) -> str:
+    lower = harness_cmd.lower()
+    if "pytest" in lower:
+        return "pytest"
+    if "unittest" in lower:
+        return "unittest"
+    if "jest" in lower or "vitest" in lower or "npm test" in lower:
+        return "javascript_test"
+    if "godot" in lower:
+        return "godot_test"
+    return "custom_harness"
+
+
+def infer_failure_taxonomy(status: int, harness_excerpt: str, diff_summary: str) -> tuple[str, str]:
+    if status == 0:
+        return "success", "validated_pass"
+
+    text = harness_excerpt.lower()
+    if "lines=0" in diff_summary:
+        return "no_effect_change", "model_output_did_not_change_repo"
+    if any(token in text for token in ["syntaxerror", "indentationerror", "parseerror"]):
+        return "runtime_failure", "syntax_error"
+    if any(token in text for token in ["importerror", "modulenotfounderror", "no module named"]):
+        return "tooling_failure", "import_or_dependency_error"
+    if any(token in text for token in ["assertionerror", "assert ", "expected", " != ", " == "]):
+        return "test_failure", "assertion_failure"
+    if "timeout" in text:
+        return "runtime_failure", "timeout"
+    if any(token in text for token in ["attributeerror", "typeerror", "keyerror", "valueerror", "indexerror", "nameerror"]):
+        return "runtime_failure", "runtime_exception"
+    if any(token in text for token in ["not found", "no such file", "filenotfounderror"]):
+        return "tooling_failure", "missing_file"
+    return "test_failure", "unknown_failure"
+
+
+def infer_patch_type(diff_summary: str, files: list[str], task: str) -> str:
+    lower = " ".join([diff_summary, task, ",".join(files)]).lower()
+    if "test" in lower:
+        return "test"
+    if "config" in lower or ".json" in lower or ".yaml" in lower:
+        return "config"
+    if any(token in lower for token in ["fix", "bug", "error", "repair", "修正"]):
+        return "bugfix"
+    if any(token in lower for token in ["refactor", "cleanup", "rename", "重構"]):
+        return "refactor"
+    if any(token in lower for token in ["add", "create", "implement", "新增", "建立", "實作"]):
+        return "feature"
+    return "other"
+
+
+def update_strategy_effectiveness(record: dict) -> None:
+    status = int(record.get("status", 1))
+    selected_l4_ids = record.get("context", {}).get("selected_l4_ids", [])
+    selected_l5_ids = record.get("context", {}).get("selected_l5_ids", [])
+
+    if not selected_l4_ids and not selected_l5_ids:
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    l4 = load_json(PATHS["L4"])
+    for item in l4:
+        if item.get("id") in selected_l4_ids:
+            item["use_count"] = int(item.get("use_count", 0)) + 1
+            if status == 0:
+                item["pass_count"] = int(item.get("pass_count", 0)) + 1
+            else:
+                item["fail_count"] = int(item.get("fail_count", 0)) + 1
+            item["last_selected"] = today
+    save_json(PATHS["L4"], l4)
+
+    l5 = load_json(PATHS["L5"])
+    for item in l5:
+        if item.get("id") in selected_l5_ids:
+            item["use_count"] = int(item.get("use_count", 0)) + 1
+            if status == 0:
+                item["success_count"] = int(item.get("success_count", 0)) + 1
+            else:
+                item["fail_count"] = int(item.get("fail_count", 0)) + 1
+            item["last_selected"] = today
+    save_json(PATHS["L5"], l5)
+
+    append_jsonl(PATHS["STRATEGY_HISTORY"], {
+        "time": datetime.now().isoformat(),
+        "episode_id": record.get("id"),
+        "run_id": record.get("run_id", ""),
+        "task": record.get("task", ""),
+        "status": status,
+        "selected_l4_ids": selected_l4_ids,
+        "selected_l5_ids": selected_l5_ids,
+        "repo_type": record.get("taxonomy", {}).get("repo_type", ""),
+        "framework": record.get("taxonomy", {}).get("framework", ""),
+    })
+
+
+def compute_effectiveness(item: dict, success_key: str, fail_key: str) -> tuple[int, int, float]:
+    success = int(item.get(success_key, 0))
+    fail = int(item.get(fail_key, 0))
+    total = success + fail
+    ratio = (success / total) if total else 0.0
+    return success, fail, ratio
+
+
+def cmd_score_strategies() -> None:
+    print("[StrategyScorer] 開始評估 L4/L5 effectiveness...")
+    updates = {"l4_promoted": [], "l4_demoted": [], "l5_promoted": [], "l5_demoted": [], "l5_inactive": []}
+
+    l4 = load_json(PATHS["L4"])
+    for item in l4:
+        success, fail, ratio = compute_effectiveness(item, "pass_count", "fail_count")
+        total = success + fail
+        if total < THRESHOLDS["strategy_min_uses"]:
+            continue
+        old_conf = float(item.get("confidence", 0.0))
+        if ratio >= THRESHOLDS["strategy_promote_ratio"]:
+            item["confidence"] = round(min(0.95, old_conf + 0.03), 3)
+            item["last_scored"] = datetime.now().isoformat()
+            item["score_note"] = f"promoted ratio={ratio:.2f} total={total}"
+            updates["l4_promoted"].append(item["id"])
+            print(f"  [L4↑] {item['id']} {old_conf:.2f} -> {item['confidence']:.2f} ratio={ratio:.0%}")
+        elif ratio <= THRESHOLDS["strategy_demote_ratio"]:
+            item["confidence"] = round(max(0.30, old_conf - 0.04), 3)
+            item["last_scored"] = datetime.now().isoformat()
+            item["score_note"] = f"demoted ratio={ratio:.2f} total={total}"
+            updates["l4_demoted"].append(item["id"])
+            print(f"  [L4↓] {item['id']} {old_conf:.2f} -> {item['confidence']:.2f} ratio={ratio:.0%}")
+    save_json(PATHS["L4"], l4)
+
+    l5 = load_json(PATHS["L5"])
+    for item in l5:
+        success, fail, ratio = compute_effectiveness(item, "success_count", "fail_count")
+        total = success + fail
+        if total < THRESHOLDS["strategy_min_uses"]:
+            continue
+        old_conf = float(item.get("confidence", 0.0))
+        if ratio >= THRESHOLDS["strategy_promote_ratio"]:
+            item["confidence"] = round(min(0.98, old_conf + 0.04), 3)
+            item["last_scored"] = datetime.now().isoformat()
+            item["score_note"] = f"promoted ratio={ratio:.2f} total={total}"
+            updates["l5_promoted"].append(item["id"])
+            print(f"  [L5↑] {item['id']} {old_conf:.2f} -> {item['confidence']:.2f} ratio={ratio:.0%}")
+        elif ratio <= THRESHOLDS["strategy_demote_ratio"]:
+            item["confidence"] = round(max(0.25, old_conf - 0.05), 3)
+            item["last_scored"] = datetime.now().isoformat()
+            item["score_note"] = f"demoted ratio={ratio:.2f} total={total}"
+            updates["l5_demoted"].append(item["id"])
+            print(f"  [L5↓] {item['id']} {old_conf:.2f} -> {item['confidence']:.2f} ratio={ratio:.0%}")
+            if item["confidence"] < THRESHOLDS["inactive_threshold"]:
+                item["status"] = "inactive"
+                updates["l5_inactive"].append(item["id"])
+                print("       -> inactive")
+    save_json(PATHS["L5"], l5)
+
+    total_changes = sum(len(v) for v in updates.values())
+    if total_changes == 0:
+        print("[StrategyScorer] 無足夠樣本或暫無需調整的策略")
+        return
+    print(f"[StrategyScorer] 完成，共調整 {total_changes} 項")
+
+
 # ─────────────────────────────────────────────
 # --init
 # ─────────────────────────────────────────────
@@ -233,6 +457,8 @@ def gen_id(prefix: str, path: Path) -> str:
 def cmd_init():
     print("初始化記憶系統...")
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    TRACE_ROOT.mkdir(parents=True, exist_ok=True)
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
     for key, path in PATHS.items():
         if not path.exists():
@@ -305,10 +531,141 @@ def episode_importance_score(
     return score, reasons, priority, pool
 
 
-def cmd_record(status: int, task: str, diff_summary: str, harness_delta: float = 0.0):
+def build_training_sample(record: dict) -> Optional[dict]:
+    artifacts = record.get("artifacts", {})
+    prompt_excerpt = artifacts.get("prompt_excerpt", "").strip()
+    strategy_summary = artifacts.get("patch_summary", "").strip() or record.get("diff_summary", "").strip()
+    if not prompt_excerpt or not strategy_summary:
+        return None
+
+    context = record.get("context", {})
+    workflow = record.get("workflow", {})
+    files = context.get("files", [])
+    l4_ids = context.get("selected_l4_ids", [])
+    l5_ids = context.get("selected_l5_ids", [])
+    harness_excerpt = artifacts.get("harness_excerpt", "").strip()
+
+    user_parts = [
+        f"Task:\n{record.get('task', '')}",
+        f"Prompt excerpt:\n{prompt_excerpt}",
+    ]
+    if files:
+        user_parts.append(f"Candidate files:\n{', '.join(files)}")
+    if l4_ids:
+        user_parts.append(f"Selected L4:\n{', '.join(l4_ids)}")
+    if l5_ids:
+        user_parts.append(f"Selected L5:\n{', '.join(l5_ids)}")
+    if workflow:
+        workflow_lines = [
+            f"task_type={workflow.get('task_type', '')}",
+            f"complexity={workflow.get('complexity', '')}",
+            f"mode={workflow.get('execution_mode', '')}",
+        ]
+        if workflow.get("goal"):
+            workflow_lines.append(f"goal={workflow.get('goal')}")
+        if workflow.get("constraints"):
+            workflow_lines.append(f"constraints={workflow.get('constraints')}")
+        if workflow.get("acceptance"):
+            workflow_lines.append(f"acceptance={workflow.get('acceptance')}")
+        if workflow.get("file_plan"):
+            workflow_lines.append(f"file_plan={workflow.get('file_plan')}")
+        if workflow.get("research_reason"):
+            workflow_lines.append(f"research_reason={workflow.get('research_reason')}")
+        if workflow.get("rollback_reason"):
+            workflow_lines.append(f"rollback_reason={workflow.get('rollback_reason')}")
+        user_parts.append(f"Workflow signals:\n" + "\n".join(workflow_lines))
+    if harness_excerpt and record.get("status") != 0:
+        user_parts.append(f"Recent harness failure:\n{harness_excerpt}")
+
+    expected_outcome = "讓 harness 通過並完成任務" if record.get("status") == 0 else "先縮小風險並避免重複失敗"
+    assistant_parts = [
+        f"策略摘要：{strategy_summary}",
+        f"建議修改檔案：{', '.join(files) if files else '(未提供)'}",
+        f"預期結果：{expected_outcome}",
+    ]
+
+    return {
+        "id": record.get("id"),
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是程式任務策略模型。根據任務、記憶注入與最近失敗訊號，輸出下一步修復策略摘要。",
+            },
+            {
+                "role": "user",
+                "content": "\n\n".join(user_parts),
+            },
+            {
+                "role": "assistant",
+                "content": "\n".join(assistant_parts),
+            },
+        ],
+        "metadata": {
+            "status": record.get("status"),
+            "score": record.get("score"),
+            "pool": record.get("pool"),
+            "task_complete": record.get("task_complete", False),
+            "workflow_mode": workflow.get("execution_mode", ""),
+            "task_type": workflow.get("task_type", ""),
+        },
+    }
+
+
+def cmd_record(
+    status: int,
+    task: str,
+    diff_summary: str,
+    harness_delta: float = 0.0,
+    *,
+    files: Optional[list[str]] = None,
+    iteration: int = 0,
+    max_iter: int = 0,
+    aider_model: str = "",
+    harness_cmd: str = "",
+    work_dir: str = "",
+    prompt_excerpt: str = "",
+    harness_excerpt: str = "",
+    selected_l4_ids: Optional[list[str]] = None,
+    selected_l5_ids: Optional[list[str]] = None,
+    patch_summary: str = "",
+    task_complete: bool = False,
+    run_id: str = "",
+    trace_dir: str = "",
+    failure_mode: str = "",
+    root_cause: str = "",
+    patch_type: str = "",
+    repo_type: str = "",
+    language: str = "",
+    framework: str = "",
+    test_scope: str = "",
+    workflow_task_type: str = "",
+    workflow_complexity: str = "",
+    workflow_mode: str = "",
+    workflow_file_plan: str = "",
+    workflow_goal: str = "",
+    workflow_constraints: str = "",
+    workflow_acceptance: str = "",
+    workflow_research_reason: str = "",
+    workflow_rollback_reason: str = "",
+    workflow_strategy_note: str = "",
+):
     score, reasons, priority, pool = episode_importance_score(
         task, status, diff_summary, harness_delta
     )
+
+    files = files or []
+    selected_l4_ids = selected_l4_ids or []
+    selected_l5_ids = selected_l5_ids or []
+    framework = framework or infer_framework(files, task, harness_cmd, work_dir)
+    repo_type = repo_type or infer_repo_type(framework, files, task)
+    language = language or infer_language(files)
+    test_scope = test_scope or infer_test_scope(harness_cmd)
+    failure_mode, root_cause = (
+        (failure_mode, root_cause)
+        if failure_mode and root_cause
+        else infer_failure_taxonomy(status, harness_excerpt, diff_summary)
+    )
+    patch_type = patch_type or infer_patch_type(diff_summary, files, task)
 
     ep_id = gen_id("ep", PATHS["L3"])
     record = {
@@ -322,13 +679,78 @@ def cmd_record(status: int, task: str, diff_summary: str, harness_delta: float =
         "reasons": reasons,
         "priority": priority,
         "pool": pool,
+        "task_complete": task_complete,
+        "run_id": run_id,
+        "trace_dir": trace_dir,
+        "context": {
+            "iteration": iteration,
+            "max_iter": max_iter,
+            "aider_model": aider_model[:120],
+            "harness_cmd": sanitize_text(harness_cmd, 300),
+            "work_dir": work_dir[:300],
+            "files": files[:20],
+            "selected_l4_ids": selected_l4_ids[:10],
+            "selected_l5_ids": selected_l5_ids[:10],
+        },
+        "artifacts": {
+            "prompt_excerpt": sanitize_text(prompt_excerpt, 1500),
+            "harness_excerpt": sanitize_text(harness_excerpt, 1200),
+            "patch_summary": sanitize_text(patch_summary, 1200),
+        },
+        "taxonomy": {
+            "failure_mode": failure_mode,
+            "root_cause": root_cause,
+            "patch_type": patch_type,
+            "repo_type": repo_type,
+            "language": language,
+            "framework": framework,
+            "test_scope": test_scope,
+        },
+        "workflow": {
+            "task_type": workflow_task_type,
+            "complexity": workflow_complexity,
+            "execution_mode": workflow_mode,
+            "goal": sanitize_text(workflow_goal, 400),
+            "constraints": sanitize_text(workflow_constraints, 800),
+            "acceptance": sanitize_text(workflow_acceptance, 800),
+            "file_plan": sanitize_text(workflow_file_plan, 1200),
+            "research_reason": workflow_research_reason,
+            "rollback_reason": workflow_rollback_reason,
+            "strategy_note": sanitize_text(workflow_strategy_note, 1200),
+        },
     }
+    record["training_ready"] = build_training_sample(record) is not None
 
     append_jsonl(PATHS["L3"], record)
+    update_strategy_effectiveness(record)
     print(f"[L3] 記錄事件 {ep_id} | 分數：{score} | 優先：{priority} | 池：{pool}")
     if reasons:
         for r in reasons:
             print(f"       + {r}")
+
+
+def cmd_export_training_data(output_path: str = "", include_failed: bool = False) -> None:
+    episodes = load_jsonl(PATHS["L3"])
+    samples = []
+    for record in episodes:
+        if not include_failed and record.get("status") != 0:
+            continue
+        sample = build_training_sample(record)
+        if sample:
+            samples.append(sample)
+
+    if not samples:
+        print("[Export] 沒有可匯出的訓練樣本")
+        return
+
+    if output_path:
+        target = Path(output_path)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        target = EXPORT_DIR / f"training_data_{timestamp}.jsonl"
+
+    write_jsonl(target, samples)
+    print(f"[Export] 已輸出 {len(samples)} 筆訓練樣本 → {target}")
 
 
 # ─────────────────────────────────────────────
@@ -1000,6 +1422,16 @@ def cmd_wake():
         for w in warnings:
             print(f"       {w}")
 
+    append_jsonl(PATHS["WAKE_HISTORY"], {
+        "time": now.isoformat(),
+        "injected_l4_ids": [item["id"] for item in l4_inject[:5]],
+        "injected_l5_ids": [item["id"] for item in l5_inject[:5]],
+        "active_l4_count": len([item for item in l4_all if item.get("status") == "active"]),
+        "active_l5_count": len([item for item in l5_all if item.get("status") == "active"]),
+        "warning_count": len(warnings),
+        "warnings": warnings[:5],
+    })
+
 
 # ─────────────────────────────────────────────
 # Bridge Schema Validator（純 Python，不呼叫模型）
@@ -1181,9 +1613,17 @@ def cmd_status():
     episodes = load_jsonl(PATHS["L3"])
     validated = [e for e in episodes if e.get("pool") == "validated"]
     candidate = [e for e in episodes if e.get("pool") == "candidate"]
+    training_ready = [e for e in episodes if e.get("training_ready")]
     print(f"\n[L3] 事件池")
     print(f"     驗證池 (score>=6)：{len(validated)} 件")
     print(f"     候選池 (score< 6)：{len(candidate)} 件")
+    print(f"     可匯出訓練樣本：{len(training_ready)} 件")
+    wake_history = load_jsonl(PATHS["WAKE_HISTORY"])
+    strategy_history = load_jsonl(PATHS["STRATEGY_HISTORY"])
+    benchmark_history = load_jsonl(PATHS["BENCHMARK_HISTORY"])
+    print(f"     wake 歷史：{len(wake_history)} 次")
+    print(f"     strategy 使用紀錄：{len(strategy_history)} 件")
+    print(f"     benchmark 歷史：{len(benchmark_history)} 次")
 
     l4 = load_json(PATHS["L4"])
     l4_active   = [k for k in l4 if k.get("status") == "active"]
@@ -1196,6 +1636,15 @@ def cmd_status():
     if l4_active:
         avg_conf = sum(k.get("confidence", 0) for k in l4_active) / len(l4_active)
         print(f"     平均 confidence：{avg_conf:.2f}")
+        top_l4 = sorted(l4_active, key=lambda x: x.get("use_count", 0), reverse=True)[:3]
+        if any(item.get("use_count", 0) > 0 for item in top_l4):
+            print("     常用 L4：")
+            for item in top_l4:
+                if item.get("use_count", 0) > 0:
+                    print(
+                        f"       {item['id']} use={item.get('use_count', 0)} "
+                        f"pass={item.get('pass_count', 0)} fail={item.get('fail_count', 0)}"
+                    )
 
     l5 = load_json(PATHS["L5"])
     l5_active   = [s for s in l5 if s.get("status") == "active"]
@@ -1207,6 +1656,15 @@ def cmd_status():
     print(f"     inactive     ：{len(l5_inactive)} 條")
     print(f"     retired      ：{len(l5_retired)} 條")
     print(f"     needs_review ：{len(l5_review)} 條")
+    top_l5 = sorted(l5_active, key=lambda x: x.get("use_count", 0), reverse=True)[:3]
+    if any(item.get("use_count", 0) > 0 for item in top_l5):
+        print("     常用 L5：")
+        for item in top_l5:
+            if item.get("use_count", 0) > 0:
+                print(
+                    f"       {item['id']} use={item.get('use_count', 0)} "
+                    f"success={item.get('success_count', 0)} fail={item.get('fail_count', 0)}"
+                )
 
     now = datetime.now()
     warn_items = []
@@ -1245,15 +1703,50 @@ def main():
     parser.add_argument("--decay",            action="store_true", help="執行記憶衰減")
     parser.add_argument("--bridge",           action="store_true", help="MemPalace → L3 橋接")
     parser.add_argument("--status",           action="store_true", help="顯示記憶系統狀態")
+    parser.add_argument("--export-training-data", action="store_true", help="匯出 decision-SFT 訓練樣本")
+    parser.add_argument("--score-strategies", action="store_true", help="依 effectiveness 調整 L4/L5 confidence")
 
     # --record 參數
     parser.add_argument("--status-code",   type=int,   default=0,   dest="status_code")
     parser.add_argument("--task",          type=str,   default="",  dest="task")
     parser.add_argument("--diff-summary",  type=str,   default="",  dest="diff_summary")
     parser.add_argument("--harness-delta", type=float, default=0.0, dest="harness_delta")
+    parser.add_argument("--files",         type=str,   default="",  dest="files")
+    parser.add_argument("--iteration",     type=int,   default=0,   dest="iteration")
+    parser.add_argument("--max-iter",      type=int,   default=0,   dest="max_iter")
+    parser.add_argument("--aider-model",   type=str,   default="",  dest="aider_model")
+    parser.add_argument("--harness-cmd",   type=str,   default="",  dest="harness_cmd")
+    parser.add_argument("--work-dir",      type=str,   default="",  dest="work_dir")
+    parser.add_argument("--prompt-excerpt", type=str,  default="",  dest="prompt_excerpt")
+    parser.add_argument("--harness-excerpt", type=str, default="",  dest="harness_excerpt")
+    parser.add_argument("--selected-l4-ids", type=str, default="",  dest="selected_l4_ids")
+    parser.add_argument("--selected-l5-ids", type=str, default="",  dest="selected_l5_ids")
+    parser.add_argument("--patch-summary", type=str,   default="",  dest="patch_summary")
+    parser.add_argument("--task-complete", type=int,   default=0,   dest="task_complete")
+    parser.add_argument("--run-id",        type=str,   default="",  dest="run_id")
+    parser.add_argument("--trace-dir",     type=str,   default="",  dest="trace_dir")
+    parser.add_argument("--failure-mode",  type=str,   default="",  dest="failure_mode")
+    parser.add_argument("--root-cause",    type=str,   default="",  dest="root_cause")
+    parser.add_argument("--patch-type",    type=str,   default="",  dest="patch_type")
+    parser.add_argument("--repo-type",     type=str,   default="",  dest="repo_type")
+    parser.add_argument("--language",      type=str,   default="",  dest="language")
+    parser.add_argument("--framework",     type=str,   default="",  dest="framework")
+    parser.add_argument("--test-scope",    type=str,   default="",  dest="test_scope")
+    parser.add_argument("--workflow-task-type", type=str, default="", dest="workflow_task_type")
+    parser.add_argument("--workflow-complexity", type=str, default="", dest="workflow_complexity")
+    parser.add_argument("--workflow-mode", type=str, default="", dest="workflow_mode")
+    parser.add_argument("--workflow-file-plan", type=str, default="", dest="workflow_file_plan")
+    parser.add_argument("--workflow-goal", type=str, default="", dest="workflow_goal")
+    parser.add_argument("--workflow-constraints", type=str, default="", dest="workflow_constraints")
+    parser.add_argument("--workflow-acceptance", type=str, default="", dest="workflow_acceptance")
+    parser.add_argument("--workflow-research-reason", type=str, default="", dest="workflow_research_reason")
+    parser.add_argument("--workflow-rollback-reason", type=str, default="", dest="workflow_rollback_reason")
+    parser.add_argument("--workflow-strategy-note", type=str, default="", dest="workflow_strategy_note")
 
     # --update-mempalace / --bridge 參數
     parser.add_argument("--context", type=str, default="", dest="context")
+    parser.add_argument("--output", type=str, default="", dest="output")
+    parser.add_argument("--include-failed", action="store_true", dest="include_failed")
 
     # 模型覆寫
     parser.add_argument("--model", type=str, default=OLLAMA_MODEL, dest="model")
@@ -1273,6 +1766,37 @@ def main():
             task=args.task,
             diff_summary=args.diff_summary,
             harness_delta=args.harness_delta,
+            files=[f for f in args.files.split(",") if f],
+            iteration=args.iteration,
+            max_iter=args.max_iter,
+            aider_model=args.aider_model,
+            harness_cmd=args.harness_cmd,
+            work_dir=args.work_dir,
+            prompt_excerpt=args.prompt_excerpt,
+            harness_excerpt=args.harness_excerpt,
+            selected_l4_ids=[f for f in args.selected_l4_ids.split(",") if f],
+            selected_l5_ids=[f for f in args.selected_l5_ids.split(",") if f],
+            patch_summary=args.patch_summary,
+            task_complete=bool(args.task_complete),
+            run_id=args.run_id,
+            trace_dir=args.trace_dir,
+            failure_mode=args.failure_mode,
+            root_cause=args.root_cause,
+            patch_type=args.patch_type,
+            repo_type=args.repo_type,
+            language=args.language,
+            framework=args.framework,
+            test_scope=args.test_scope,
+            workflow_task_type=args.workflow_task_type,
+            workflow_complexity=args.workflow_complexity,
+            workflow_mode=args.workflow_mode,
+            workflow_file_plan=args.workflow_file_plan,
+            workflow_goal=args.workflow_goal,
+            workflow_constraints=args.workflow_constraints,
+            workflow_acceptance=args.workflow_acceptance,
+            workflow_research_reason=args.workflow_research_reason,
+            workflow_rollback_reason=args.workflow_rollback_reason,
+            workflow_strategy_note=args.workflow_strategy_note,
         )
     elif args.update_mempalace:
         cmd_update_mempalace(context=args.context)
@@ -1288,6 +1812,13 @@ def main():
         cmd_bridge(mempalace_output=args.context)
     elif args.status:
         cmd_status()
+    elif args.export_training_data:
+        cmd_export_training_data(
+            output_path=args.output,
+            include_failed=args.include_failed,
+        )
+    elif args.score_strategies:
+        cmd_score_strategies()
     else:
         parser.print_help()
 

@@ -1,0 +1,56 @@
+{
+  "name": "coding_suite_v1",
+  "description": "5 個 Python coding 修正任務，測試系統基礎除錯與實作能力",
+  "cases": [
+    {
+      "id": "fix_sort",
+      "task": "修正 solution.py 中的 bubble_sort 函式。問題：內層迴圈範圍錯誤，在最後一次迭代時會發生 IndexError。修正後所有 test_sort.py 測試必須通過。完成後輸出 TASK_COMPLETE",
+      "harness": "python3 -m pytest tests/test_sort.py -q",
+      "work_dir": "${BENCH_TASKS}/fix_sort",
+      "aider_files": ["solution.py"],
+      "max_iter": 6,
+      "score_pattern": "passed",
+      "aider_model": "ollama/qwen2.5-coder:14b"
+    },
+    {
+      "id": "fix_cache",
+      "task": "修正 solution.py 中的 LRUCache.get() 方法。問題：get() 沒有把存取的 key 移到最近使用位置，導致 LRU eviction 邏輯錯誤。修正後所有 test_cache.py 測試必須通過。完成後輸出 TASK_COMPLETE",
+      "harness": "python3 -m pytest tests/test_cache.py -q",
+      "work_dir": "${BENCH_TASKS}/fix_cache",
+      "aider_files": ["solution.py"],
+      "max_iter": 6,
+      "score_pattern": "passed",
+      "aider_model": "ollama/qwen2.5-coder:14b"
+    },
+    {
+      "id": "fix_parser",
+      "task": "修正 solution.py 中的 parse_csv_line() 函式。問題：直接用 split 無法處理 quoted fields（例如 'a,\"b,c\",d' 應解析為 ['a', 'b,c', 'd']）。需實作正確的 CSV quoted field 解析邏輯。完成後輸出 TASK_COMPLETE",
+      "harness": "python3 -m pytest tests/test_parser.py -q",
+      "work_dir": "${BENCH_TASKS}/fix_parser",
+      "aider_files": ["solution.py"],
+      "max_iter": 8,
+      "score_pattern": "passed",
+      "aider_model": "ollama/qwen2.5-coder:14b"
+    },
+    {
+      "id": "fix_graph",
+      "task": "在 solution.py 中實作 topological_sort(graph) 函式。graph 為 DAG，格式為 {node: [neighbors]}。需使用 DFS 或 Kahn 演算法輸出正確的拓撲排序順序，使所有 test_graph.py 測試通過。完成後輸出 TASK_COMPLETE",
+      "harness": "python3 -m pytest tests/test_graph.py -q",
+      "work_dir": "${BENCH_TASKS}/fix_graph",
+      "aider_files": ["solution.py"],
+      "max_iter": 6,
+      "score_pattern": "passed",
+      "aider_model": "ollama/qwen2.5-coder:14b"
+    },
+    {
+      "id": "fix_validator",
+      "task": "修正 solution.py 中三個驗證函式：(1) validate_email：需正確拒絕 'user@'、'a@@b.com' 等格式。(2) validate_password：需增加大寫/小寫/數字檢查。(3) validate_phone_tw：需實作台灣手機號碼驗證（09開頭，共10碼）。完成後輸出 TASK_COMPLETE",
+      "harness": "python3 -m pytest tests/test_validator.py -q",
+      "work_dir": "${BENCH_TASKS}/fix_validator",
+      "aider_files": ["solution.py"],
+      "max_iter": 8,
+      "score_pattern": "passed",
+      "aider_model": "ollama/qwen2.5-coder:14b"
+    }
+  ]
+}
