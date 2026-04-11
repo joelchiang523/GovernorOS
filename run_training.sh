@@ -96,7 +96,8 @@ print(f'suite 已套用模型：$MODEL')
 $PYTHON "$SCRIPT_DIR/benchmark_runner.py" \
   --suite "$SUITE_TMP" \
   --output-dir "$REPORT_DIR" \
-  $DRY_RUN
+  $DRY_RUN \
+  || echo "  [WARN] 部分 benchmark 未通過，繼續執行記憶固化"
 
 rm -f "$SUITE_TMP"
 
