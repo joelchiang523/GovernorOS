@@ -66,7 +66,7 @@ OLLAMA_MODEL_GOVERNOR   = os.environ.get(
 # Researcher：Autoresearch 200字 brief（高服從、快速產出）
 OLLAMA_MODEL_RESEARCHER = os.environ.get(
     "OLLAMA_MODEL_RESEARCHER",
-    "qwen2.5:7b",
+    "qwen3.5:9b",   # 同家族 Governor（qwen3.5:27b），JSON 遵從性強，6.6GB 不與 Governor 搶 VRAM
 )
 OLLAMA_MODEL = OLLAMA_MODEL_GOVERNOR  # 向後相容
 
