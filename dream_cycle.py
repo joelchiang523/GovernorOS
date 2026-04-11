@@ -132,7 +132,7 @@ def budget_check(prompt: str, label: str = "") -> bool:
 # Ollama 呼叫
 # ─────────────────────────────────────────────
 
-def ollama_call(prompt: str, model: str = OLLAMA_MODEL, timeout: int = 300) -> str:
+def ollama_call(prompt: str, model: str = OLLAMA_MODEL, timeout: int = 600) -> str:
     try:
         resp = requests.post(
             OLLAMA_URL,

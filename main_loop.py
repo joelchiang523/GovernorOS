@@ -845,7 +845,8 @@ def update_prompt_context(task: str, iteration: int, max_iter: int,
         re.DOTALL,
     )
     replacement = f"<!-- GOAL_INJECT_START -->\n{goal_block}\n<!-- GOAL_INJECT_END -->"
-    updated = pattern.sub(replacement, content) if pattern.search(content) else (
+    # 用 lambda 避免 replacement 含 \d \1 等被當 regex template 解析
+    updated = pattern.sub(lambda m: replacement, content) if pattern.search(content) else (
         content + f"\n<!-- GOAL_INJECT_START -->\n{goal_block}\n<!-- GOAL_INJECT_END -->\n"
     )
     path.write_text(updated, encoding="utf-8")
