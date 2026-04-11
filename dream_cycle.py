@@ -1630,7 +1630,7 @@ def cmd_status():
     candidate = [e for e in episodes if e.get("pool") == "candidate"]
     training_ready = [e for e in episodes if e.get("training_ready")]
     print(f"\n[L3] 事件池")
-    print(f"     驗證池 (score>=6)：{len(validated)} 件")
+    print(f"     驗證池 (score>={THRESHOLDS['episode_min_score']})：{len(validated)} 件")
     print(f"     候選池 (score< 6)：{len(candidate)} 件")
     print(f"     可匯出訓練樣本：{len(training_ready)} 件")
     wake_history = load_jsonl(PATHS["WAKE_HISTORY"])

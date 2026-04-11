@@ -6,6 +6,7 @@
 > | v3.0 | 2026-04-08 | 初版：五層記憶 + 狀態機 + DreamCycle |
 > | v3.1 | 2026-04-09 | L2 單一真相、Snapshot Commit、Cost Governor |
 > | v3.2 | 2026-04-10 | 雙模型分工（Governor / Researcher）、Bridge Schema 驗證、--sleep/--deep 雙階段 |
+> | v3.3 | 2026-04-11 | 自動訓練基礎設施、10題 benchmark suite、MemPalace CLI、task_intake.py；修正 harness PASS→stop；L3門檻調整為 score>=2 以解除 L3→L4 阻塞 |
 
 ---
 
@@ -161,7 +162,7 @@ v3.2 核心升級：根據各環節的風險等級與任務性質，將兩個模
 
 ### L3 — 事件池（L3_episodes.jsonl）
 - **性質**：每次 Aider 執行的事件記錄，附 Episode Importance Score
-- **升級門檻**：score >= 6 進入「驗證池」，同類事件 >= 3 次才升 L4
+- **升級門檻**：score >= 2 進入「驗證池」（v3.3 調低），同類事件 >= 2 次才升 L4（v3.3 調低）
 
 ```json
 {
@@ -180,7 +181,7 @@ v3.2 核心升級：根據各環節的風險等級與任務性質，將兩個模
 
 ### L4 — 知識庫（L4_knowledge.json）
 - **性質**：可泛化的規律描述，**只記觀察，不含執行步驟**
-- **升級門檻**：同類 L3 事件 >= 3 次 + Researcher 產出 + Governor 複核通過
+- **升級門檻**：同類 L3 事件 >= 2 次（v3.3）+ Researcher 產出 + Governor 複核通過
 - **衰減**：30 天未驗證 confidence -= 0.05/週；首次 confidence 上限 0.75
 
 ```json
@@ -248,9 +249,11 @@ v3.2 核心升級：根據各環節的風險等級與任務性質，將兩個模
 | diff 涉及可重用模組（function/class/util 等） | +3 |
 | 任何失敗事件 | +2 |
 
-- score >= 6 → 進「驗證池」，優先升 L4
-- score 3-5 → 進「候選池」，累積後再考慮
-- score < 3 → 低價值，不升級
+- score >= 6 → `priority=high`（高分，優先處理）
+- score 3-5 → `priority=normal`
+- score < 3  → `priority=low`
+- score >= 2 → 進「驗證池」（v3.3 調低門檻，以確保 L4 有足夠輸入）
+- score < 2  → 進「候選池」，不升 L4
 
 #### Cost Governor
 
@@ -465,7 +468,7 @@ harness PASS          harness FAIL
 last_good_snapshot 更新   │
     │              ┌──────┴──────┐
     ▼              │             │
-  continue        1次           2次
+  stop（v3.3）    1次           2次
                    │             │
                 continue    switch_tool
                                  │
@@ -488,6 +491,7 @@ last_good_snapshot 更新   │
                                            stop（升級人工介入）
 
 特殊情況：
+  harness PASS（任何情況）     → stop（v3.3：harness 通過即停止）
   Aider 輸出含 TASK_COMPLETE → stop（任務完成）
   iteration >= max_iter       → stop（達到上限）
 ```
@@ -500,9 +504,9 @@ last_good_snapshot 更新   │
 
 ```
 原始事件
-  └─[Episode Scoring]──► L3 驗證池（score >= 6）
+  └─[Episode Scoring]──► L3 驗證池（score >= 2，v3.3）
                            │
-         [同類 >= 3次]
+         [同類 >= 2次，v3.3]
                            │
          ┌─────────────────┘
          │
@@ -586,7 +590,7 @@ crontab -e
 | 環境變數 | 預設值 | 說明 |
 |---------|--------|------|
 | `OLLAMA_MODEL_GOVERNOR` | `qwen3.5:27b` | 判斷、審核、治理 |
-| `OLLAMA_MODEL_RESEARCHER` | `prutser/gemma-4-26B-A4B-it-ara-abliterated:q5_k_m` | 生成、萃取、草稿 |
+| `OLLAMA_MODEL_RESEARCHER` | `qwen2.5:7b`（設計目標 gemma-4-26B，但 qwen2.5:7b 為預設可用值） | 生成、萃取、草稿 |
 
 ### Cost Governor
 
