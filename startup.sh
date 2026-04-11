@@ -15,7 +15,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON="${PYTHON:-python3}"
+# Use conda python if available (has requests), else auto-detect
+if [ -z "${PYTHON:-}" ]; then
+  if python3 -c "import requests" 2>/dev/null; then
+    PYTHON="python3"
+  else
+    PYTHON="$(find /opt/conda /root/miniconda3 /home/*/miniconda3 /mnt/*/conda_envs -name python3 -maxdepth 5 2>/dev/null | head -1)"
+    PYTHON="${PYTHON:-python3}"
+  fi
+fi
 DC="$PYTHON $SCRIPT_DIR/dream_cycle.py"
 DI="$PYTHON $SCRIPT_DIR/git_diff_intel.py"
 

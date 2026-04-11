@@ -104,7 +104,7 @@ class LoopStateMachine:
 
         if harness_pass:
             self.consecutive_fails = 0
-            self.state = "continue"
+            self.state = "stop"
         else:
             self.consecutive_fails += 1
             if self.consecutive_fails >= 3:

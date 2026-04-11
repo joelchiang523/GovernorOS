@@ -20,8 +20,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 停用 ollama 雲端功能與瀏覽器彈窗
 export OLLAMA_NO_CLOUD=1
 export BROWSER=""
-PYTHON="${PYTHON:-python3}"
-SUITE="$SCRIPT_DIR/benchmarks/coding_suite_v1.json"
+# Use conda python if available (has requests), else auto-detect
+if [ -z "${PYTHON:-}" ]; then
+  if python3 -c "import requests" 2>/dev/null; then
+    PYTHON="python3"
+  else
+    PYTHON="$(find /opt/conda /root/miniconda3 /home/*/miniconda3 /mnt/*/conda_envs -name python3 -maxdepth 5 2>/dev/null | head -1)"
+    PYTHON="${PYTHON:-python3}"
+  fi
+fi
+SUITE="$SCRIPT_DIR/benchmarks/coding_suite_v2.json"
 RESET_SCRIPT="$SCRIPT_DIR/benchmarks/reset_tasks.sh"
 REPORT_DIR="$SCRIPT_DIR/benchmark_reports"
 
@@ -65,7 +73,7 @@ bash "$RESET_SCRIPT"
 
 # ── Step 3: 執行 benchmark suite ───────────────────────
 echo ""
-echo "[Step 3/5] 執行 coding_suite_v1（5 題）..."
+echo "[Step 3/5] 執行 coding_suite_v2（10 題）..."
 echo "  使用模型：$MODEL"
 echo "  報告輸出：$REPORT_DIR"
 echo ""
