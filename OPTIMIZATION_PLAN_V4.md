@@ -1,9 +1,9 @@
-# AI System v3.0 — v4.0 優化策略規劃
+# AI System v3.0 — v4.0 優化策略規劃（修正版）
 
-> **版本**：v4.0-plan  
+> **版本**：v4.0-plan-revised  
 > **撰寫日期**：2026-04-12  
 > **基準評分**：7.0/10（見下方模組評分表）  
-> **目標評分**：8.5/10  
+> **目標評分**：8.2/10  
 > **核心原則**：保留五層記憶架構與雙模型分工的優點，補強現有短板，不大幅重寫。
 
 ---
@@ -14,15 +14,15 @@
 
 | 模組 | 現況分 | 主要問題 |
 |---|---|---|
-| main_loop.py | 7.5 | DDI 補全 bug（已修）；Total Recall 在 benchmark 下永遠跳過 |
-| dream_cycle.py | 7.0 | L5 空白；L4 有 ID 重複；age decay 新加未驗證 |
+| main_loop.py | 7.5 | DDI 補全 bug（已修）；Total Recall 已整合但 benchmark 下實際上被 FAST_MODE 間接跳過 |
+| dream_cycle.py | 7.0 | L5 空白；L4 有重複項；現有去重只在 `--deep`，不會重編 id |
 | benchmark_runner.py | 8.5 | 最穩定；無重大問題 |
 | git_diff_intel.py | 6.5 | 資料收集完整但未被其他模組消費 |
 | mempalace.py | 6.0 | benchmark 全跳過，影響力低 |
 | task_intake.py | 5.5 | 在 benchmark 流程中被繞過 |
 | **L5 策略庫** | 3.0 | **0 筆 active，功能形同虛設** |
 | **L4 知識庫** | 6.0 | confidence 普遍 0.55–0.70，有 ID 重複 |
-| Total Recall | — | 已整合但 FAST_MODE 永遠跳過，從未驗證 |
+| Total Recall | 4.5 | 已整合但 benchmark 下實際未被驗證 |
 
 ### 根本問題歸類
 
@@ -31,10 +31,10 @@
   └─ 根因：L4 confidence 未超過 0.75（升 L5 門檻），dream cycle 跑太少
   
 問題 B：L4 ID 重複與 confidence 偏低
-  └─ 根因：--sleep 每次重新生成 id，未去重；scoring 參數偏保守
+  └─ 根因：現有去重只在 --deep 執行，且只做相似條目合併，不會做 id 正規化；scoring 參數偏保守
   
 問題 C：Total Recall 無法在 benchmark 被驗證
-  └─ 根因：FAST_MODE=1 統一跳過所有 LLM 呼叫，recall 無法獨立開關
+  └─ 根因：FAST_MODE=1 為總開關，benchmark 與主迴圈沒有 recall 專屬開關
   
 問題 D：DiffIntel 資料孤島
   └─ 根因：--analyze 結果只印出報表，未寫入 L4/L5，無法被 DDI 利用
@@ -74,7 +74,7 @@ P1（下週）：啟動 L5
   └─ O4：L4 confidence 校準（初始值 0.65→0.70，evidence_count 加速加分）
 
 P2（兩週後）：打通 DiffIntel
-  └─ O5：DiffIntel → L4 直接寫入通道
+  └─ O5：DiffIntel → L4 candidate 寫入通道
 
 P3（三週後）：Total Recall 獨立開關
   └─ O6：FAST_MODE 拆成三個子開關（mempalace / bridge / recall）
@@ -86,38 +86,30 @@ P3（三週後）：Total Recall 獨立開關
 
 ---
 
-### O1：L4 ID 去重與重新編號
+### O1：L4 去重補強與 ID 正規化
 
 **問題**：L4 目前有 k_009 和 k_010 各出現兩次，造成 confidence 計算混亂。
 
-**修正方式**：在 `dream_cycle.py` 的 `cmd_sleep()` Phase 2 後，加入 ID 正規化步驟。
+**修正方式**：保留現有 `cmd_deep()` 的 `_deduplicate_l4()`，再補一個 `normalize_l4_ids()`。  
+不要再做第二套平行去重，避免邏輯分叉。
 
 **檔案**：`dream_cycle.py`  
-**位置**：`cmd_sleep()` → Phase 2 複核完成後
+**位置**：
+
+1. `_deduplicate_l4()` 之後
+2. `cmd_deep()` 寫回 L4 前
 
 **實作邏輯**：
 ```python
 def _normalize_l4_ids(items: list[dict]) -> list[dict]:
-    """重新編號所有 L4 items，解決 id 重複問題。"""
-    seen_patterns = {}
+    """在既有去重後重新編號 active L4，保證 id 唯一且連續。"""
     normalized = []
     counter = 1
     for item in items:
-        pattern = item.get("pattern", "")
-        # 相同 pattern 的合併（取 confidence 較高者，累加 evidence_count）
-        key = pattern[:40]  # 前 40 字做 key
-        if key in seen_patterns:
-            existing = seen_patterns[key]
-            existing["confidence"] = max(existing["confidence"], item["confidence"])
-            existing["evidence_count"] += item.get("evidence_count", 0)
-            existing["source_episodes"] = list(set(
-                existing.get("source_episodes", []) + item.get("source_episodes", [])
-            ))
-            continue
-        item["id"] = f"k_{counter:03d}"
-        seen_patterns[key] = item
+        if item.get("status") == "active":
+            item["id"] = f"k_{counter:03d}"
+            counter += 1
         normalized.append(item)
-        counter += 1
     return normalized
 ```
 
@@ -138,37 +130,36 @@ validated episodde 達 356 筆，但 L4 只有 10 筆 active
 **修正方式**：
 
 1. **`dream_cycle.py --bridge`**：觸發門檻從 10 episode → 5 episode
-2. **`run_training.sh`**：每輪 benchmark 結束後，強制執行一次 `--sleep` + `--deep`（不管 episode 數量）
+2. **`run_training.sh`**：每輪 benchmark 結束後，若本輪新增 validated episodes >= 5，再執行一次 `--sleep` + `--deep`
 
 **檔案**：`dream_cycle.py`
 
 ```python
-# 現況：
-BRIDGE_AUTO_SLEEP_INTERVAL = 10  
-
-# 改為：
-BRIDGE_AUTO_SLEEP_INTERVAL = 5
+# 現況：validated_count % 10 == 0
+# 改為：validated_count % 5 == 0
 ```
 
 **`run_training.sh` 新增 Step**：
 ```bash
 # Step 4.5（介於 benchmark 結束與 evening 之間）
-echo "[Step 4.5] 強制記憶固化（--sleep + --deep）..."
-python3 dream_cycle.py --sleep
-python3 dream_cycle.py --deep
-python3 dream_cycle.py --wake
+if [ "$NEW_VALIDATED_EPISODES" -ge 5 ]; then
+  echo "[Step 4.5] 本輪新增 validated episodes >= 5，執行記憶固化..."
+  python3 dream_cycle.py --sleep
+  python3 dream_cycle.py --deep
+  python3 dream_cycle.py --wake
+fi
 ```
 
 **驗收標準**：每次跑完 10 題 benchmark，L4 至少新增 2 筆；30 題後 L5 有 1+ 筆 active。
 
 ---
 
-### O3：L4→L5 升級門檻調整（0.75→0.65）
+### O3：L4→L5 升級與注入門檻調整（分階段）
 
 **問題**：L5 策略庫完全空白，根因是 L4 的 confidence 最高只有 0.70，低於升 L5 門檻 0.75。
 
-**策略**：降低門檻，先讓 L5 有資料，再觀察效果後調整。  
-這不影響 L4 準確性，只是讓「已有中等信心」的知識被提升為可執行策略。
+**策略**：降低「升級門檻」，但不要同步放寬到完全相同的「注入門檻」。  
+目標是先讓 L5 有資料，再用 `needs_validation` 與 success/fail 追蹤決定哪些策略能進 prompt。
 
 **檔案**：`dream_cycle.py`
 
@@ -176,25 +167,24 @@ python3 dream_cycle.py --wake
 # 現況：
 L4_TO_L5_MIN_CONF = 0.75
 
-# 改為：
-L4_TO_L5_MIN_CONF = 0.65
+# 改為（升級門檻）：
+l4_to_l5_min_conf = 0.65
+
+# wake 注入門檻同步調整，但保守一些：
+wake_l5_min_conf = 0.70
 ```
 
-**同步修改**：Phase 2 Governor 複核的 confidence 上限也需調整
+**同步修改**：初始 L5 標記 `needs_validation=true`
 
 ```python
-# 現況：Governor 複核時 confidence 上限 0.75
-# 改為：L4 首次生成上限 0.72（給升 L5 留空間）
-L4_INITIAL_CONF_CAP = 0.72  # 由 0.75 降至 0.72
-
-# L5 首次生成上限維持 0.80
-L5_INITIAL_CONF_CAP = 0.80
+item["needs_validation"] = True
+item["promotion_source"] = "mid_conf_l4"
 ```
 
 **安全機制**（避免品質下降）：
 - L5 每次被用於推理後，`success_count` / `fail_count` 追蹤
 - fail_rate > 35%（從 40% 降）時提前降回 L4
-- 新增 `needs_validation` 欄位，首次從低 confidence 升上來的 L5 標記此旗標
+- `needs_validation=true` 的 L5 一次只注入 1 條，避免 prompt 污染
 
 **驗收標準**：2 週內 L5 有 3+ 筆 active；fail_rate < 35%。
 
@@ -221,7 +211,7 @@ evidence_count 對 confidence 的參考：
   11+ 筆  → confidence 0.73–0.75（上限 0.75）
 ```
 
-同時在 `_normalize_l4_ids()` 合併時，重新計算 confidence：
+同時在 L4 合併與寫回時，重新計算 confidence：
 
 ```python
 def _recalc_confidence(item: dict) -> float:
@@ -236,7 +226,7 @@ def _recalc_confidence(item: dict) -> float:
 
 ---
 
-### O5：DiffIntel → L4 直接寫入通道
+### O5：DiffIntel → L4 candidate 寫入通道
 
 **問題**：`git_diff_intel.py --analyze` 已能萃取「高風險改動 pattern」，但結果只印報表，未寫入 L4。
 
@@ -246,7 +236,7 @@ def _recalc_confidence(item: dict) -> float:
 但 git_diff_records.jsonl 的分析結果從未回饋到 L4
 ```
 
-**修正方式**：在 `git_diff_intel.py` 增加 `--export-l4` 子指令，將高信心 pattern 直接寫入 `L4_knowledge.json`：
+**修正方式**：在 `git_diff_intel.py` 增加 `--export-l4` 子指令，將高信心 pattern 寫入 `L4_knowledge.json`，但先標記為 `candidate` 或 `needs_validation`，不要直接進 active：
 
 **檔案**：`git_diff_intel.py`
 
@@ -255,8 +245,8 @@ def cmd_export_l4(records: list[dict], l4_path: Path) -> int:
     """
     從 DiffIntel 分析結果萃取 L4 candidates，寫入 L4_knowledge.json。
     規則：
-      - 同一檔案組合 fail_rate >= 50%，累積 >= 6 筆 → 生成 avoid-pattern L4
-      - 單一檔案 pass_rate >= 80%，累積 >= 6 筆 → 生成 action-pattern L4
+      - 同一檔案組合 fail_rate >= 50%，累積 >= 6 筆 → 生成 avoid-pattern L4 candidate
+      - 單一檔案 pass_rate >= 80%，累積 >= 6 筆 → 生成 action-pattern L4 candidate
     """
     patterns = _analyze_patterns(records)
     candidates = []
@@ -268,7 +258,8 @@ def cmd_export_l4(records: list[dict], l4_path: Path) -> int:
                 "confidence": min(0.70, 0.50 + p["count"] * 0.02),
                 "evidence_count": p["count"],
                 "source": "diff_intel",
-                "status": "active",
+                "status": "candidate",
+                "needs_validation": true,
             })
     # 寫入 L4（不覆蓋已有 source != diff_intel 的項目）
     ...
@@ -281,7 +272,7 @@ def cmd_export_l4(records: list[dict], l4_path: Path) -> int:
 python3 git_diff_intel.py --export-l4
 ```
 
-**驗收標準**：`startup.sh analyze` 執行後，L4 新增 diff-intel 來源的 pattern；下一輪任務的 DDI 可在 PROMPT.md 看到相關知識注入。
+**驗收標準**：`startup.sh analyze` 執行後，L4 新增 `source=diff_intel` 且 `status=candidate` 的 pattern；經過後續 `--sleep/--deep` 驗證後才進入 active。
 
 ---
 
@@ -335,7 +326,7 @@ if SKIP_RECALL:
 | 週次 | 優化項目 | 預計影響 | 驗收方式 |
 |---|---|---|---|
 | **Week 1** | O1（L4 去重）+ O2（觸發頻率）| L4 結構乾淨；新 benchmark 後 L4 增加 | `--status` 無重複 id |
-| **Week 1** | O3（L5 門檻 0.75→0.65）+ O4（confidence 校準）| L5 首次有資料 | L5 active >= 3 |
+| **Week 1** | O3（L5 升級/注入分階段）+ O4（confidence 校準）| L5 首次有資料且可控 | L5 active >= 3 |
 | **Week 2** | O5（DiffIntel → L4）| 來自 diff 的 pattern 自動入庫 | L4 新增 source=diff_intel |
 | **Week 2** | O6（FAST_MODE 拆分）| Total Recall 在 benchmark 啟用 | log 出現 `[Recall]` |
 | **Week 3** | 跑完整 benchmark 驗證所有優化 | 預計通過率 90%→95%（string_ops 補全修正 + recall 輔助）| benchmark pass_rate |
@@ -359,17 +350,21 @@ if SKIP_RECALL:
 
 ## 六、預期優化後系統評分
 
-| 模組 | 現況 | 目標 | 優化項 |
-|---|---|---|---|
-| main_loop.py | 7.5 | 8.5 | O6（Recall 啟用） |
-| dream_cycle.py | 7.0 | 8.5 | O1+O2+O3+O4 |
-| benchmark_runner.py | 8.5 | 8.5 | O6 子開關 |
-| git_diff_intel.py | 6.5 | 8.0 | O5（→L4 通道）|
-| L5 策略庫 | 3.0 | 7.0 | O2+O3+O4 |
-| L4 知識庫 | 6.0 | 8.0 | O1+O4 |
-| Total Recall | — | 7.0 | O6 |
+| 模組 | 修正前 | 修正後預期 | 差值 | 主要原因 |
+|---|---:|---:|---:|---|
+| main_loop.py | 7.5 | 8.2 | +0.7 | Recall 可獨立驗證，context 注入更可控 |
+| dream_cycle.py | 7.0 | 8.1 | +1.1 | L4 id 正規化、觸發頻率提升、L5 啟動 |
+| benchmark_runner.py | 8.5 | 8.8 | +0.3 | FAST_MODE 子開關後可測 recall 效益 |
+| git_diff_intel.py | 6.5 | 7.6 | +1.1 | 不再是資料孤島，但仍需後續驗證鏈 |
+| mempalace.py | 6.0 | 6.4 | +0.4 | 受益於 recall / wake 品質，但不是主提升點 |
+| task_intake.py | 5.5 | 5.8 | +0.3 | 仍非 benchmark 主路徑，提升有限 |
+| L5 策略庫 | 3.0 | 6.8 | +3.8 | 門檻調整後開始有資料且可被注入 |
+| L4 知識庫 | 6.0 | 7.8 | +1.8 | 去重、id 正規化、confidence 校準 |
+| Total Recall | 4.5 | 7.2 | +2.7 | benchmark 可真正驗證，不再被總開關遮蔽 |
 
-**整體目標評分：8.5/10**
+**整體目標評分：8.2/10**
+
+> 註：這是保守預估。若 O5 直接寫 active、或 O3 只降升級門檻不管 wake 門檻，短期分數可能反而下降。
 
 ---
 
@@ -383,7 +378,7 @@ if SKIP_RECALL:
   ✓ benchmark log 中出現 [Recall] 字樣
 
 中期（1 個月）
-  ✓ benchmark pass_rate 穩定 >= 95%
+  ✓ benchmark pass_rate 穩定 >= 92%–95%
   ✓ string_ops 通過（DDI 補全驗證修正後）
   ✓ L5 被 PROMPT.md 注入至少一條策略
   ✓ DiffIntel 貢獻至少 2 筆 L4 pattern
@@ -396,14 +391,38 @@ if SKIP_RECALL:
 
 ---
 
-## 附錄：本次已完成的修正
+## 附錄：完成進度總表
+
+### 已完成修正
 
 | 修正 | 狀態 | commit |
 |---|---|---|
-| DDI-Decompose 補全驗證（string_ops 根因） | ✅ 已完成 | 3e7088d |
-| GsTask 自適應 timeout（600s→900/1200/1800s） | ✅ 已完成 | 3e7088d |
-| keep_alive="0"（VRAM 競爭修正） | ✅ 已完成 | 7a5573e |
-| GOVERNOR_FAST_MODE=1（benchmark 提速）| ✅ 已完成 | 7a5573e |
-| Total Recall TF-IDF 整合 | ✅ 已整合（O6 後可驗證）| 3e7088d |
-| Compiled Truth + Timeline（L4 timestamps）| ✅ 已完成 | 3e7088d |
-| Dream Cycle 自動化（每 10 ep 觸發 --sleep）| ✅ 已完成（O2 加密頻率）| 3e7088d |
+| keep_alive="0"（VRAM 競爭修正） | ✅ | 7a5573e |
+| GOVERNOR_FAST_MODE→子開關（SKIP_MEMPALACE/BRIDGE/RECALL）| ✅ | 3e7088d |
+| GsTask 自適應 timeout（600s→900/1200/1800s） | ✅ | 3e7088d |
+| DDI-Decompose 補全驗證（test import 比對，string_ops 根因）| ✅ | 3e7088d |
+| Total Recall TF-IDF + embedding recall 整合 | ✅ | 3e7088d |
+| L4 ID 去重（O1：`_normalize_l4_ids`）| ✅ | 已在 dream_cycle.py |
+| L5 升級門檻 0.75→0.65（O3）+ SelfOptimize 自調 | ✅ | 已在 dream_cycle.py |
+| L5 啟動（0→6 筆 active，fail_rate 0–21%）| ✅ | 已驗證 |
+| CompiledTruth 19 條 / RegressionGate / Timeline | ✅ | 已在 dream_cycle.py |
+| Dream Cycle 自動化（bridge 每 5 ep 觸發 --sleep）| ✅ | 已在 dream_cycle.py |
+
+### 自我感知三階段實作（2026-04-12）
+
+| Phase | 項目 | 狀態 | commit |
+|---|---|---|---|
+| Phase 1 | `dream_cycle.py --diagnose`：掃描 traces，萃取 pipeline-level 模式，寫 L4 scope=pipeline | ✅ | 0b2206a |
+| Phase 1 | 首次執行結果：發現 P001（136 次無差異死循環）、P002（39 次 string_ops 反覆失敗）| ✅ | 已驗證 |
+| Phase 2 | `--diagnose --suggest`：Researcher 對 pipeline 問題生成修正建議 → `memory/system_improvements.json` | ✅ | 0b2206a |
+| Phase 3 | meta-benchmark fixtures（ddi_coverage / ddi_no_change / recall_hit）| ✅ | 0b2206a |
+| Phase 3 | `benchmarks/meta_suite.json` + `run_meta_benchmark.sh`（worktree 隔離執行）| ✅ | 0b2206a |
+
+### 待執行項目
+
+| 項目 | 說明 | 優先 |
+|---|---|---|
+| P0 S1+S2 實作 | Harness 錯誤注入 Stage 3 + 無差異 fallback（main_loop.py）| **P0** |
+| O5 DiffIntel→L4 | `git_diff_intel.py --export-l4`，356 筆 diff 資料回饋知識庫 | P2 |
+| meta-benchmark 實跑 | 執行 `run_meta_benchmark.sh` 驗證 Phase 3 三個 case | 下輪 |
+| coding_suite_v2 全跑 | 驗證 P0 修正後 string_ops 能通過，達成 10/10 | 下輪 |
