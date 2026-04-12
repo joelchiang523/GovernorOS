@@ -1033,21 +1033,32 @@ def ddi_integrate(
     filename: str,
     subtasks: list[dict],
     drafts: dict[str, str],
+    harness_error: str = "",
 ) -> str:
     """
     Stage 3（Governor）：將所有子任務草稿整合為完整、可執行的目標檔案。
     處理 import、函數順序、命名衝突，保留原始非任務相關程式碼。
+    harness_error：上一輪 harness 失敗摘要（S1），注入後幫助 Governor 精確定位問題。
     """
     drafts_text = "\n\n".join(
         f"### [{s['id']}] {s['function_name']} ###\n{drafts.get(s['id'], '(未生成，保留原有實作)')}"
         for s in subtasks
     )
 
+    # S1：若有上一輪的 harness 失敗訊息，附加到 prompt 幫助 Governor 精確定位
+    harness_hint = ""
+    if harness_error:
+        harness_hint = (
+            f"\n【上一輪 Harness 失敗訊息（必須修正）】\n"
+            f"{harness_error[-600:]}\n"
+            f"請確保整合後的程式碼能解決上述失敗，尤其注意失敗的函數實作。\n"
+        )
+
     prompt = f"""你是程式整合專家。將各函數草稿整合成完整、可直接執行的 Python 檔案。
 
 任務：{task}
 目標檔案：{filename}
-
+{harness_hint}
 原始檔案（保留非任務相關程式碼）：
 {file_content[:1800]}
 
@@ -1161,19 +1172,56 @@ def _single_shot_generate(task: str, file_content: str, filename: str, model: st
     return blocks[-1].strip() if blocks else raw.strip()
 
 
+def _ddi_no_change_fallback(
+    task: str,
+    file_content: str,
+    filename: str,
+    harness_error: str,
+    model: str,
+) -> str:
+    """
+    S2：當 DDI integrate 連續 2 次產生無差異時，改用 Researcher 直接重寫失敗函數。
+    從 harness_error 解析失敗的函數名，讓 Researcher 針對性重寫，跳過 Governor integrate。
+    """
+    # 從 harness 輸出解析最可能失敗的函數名
+    failing_fn = ""
+    if harness_error:
+        # AssertionError 或 def funcname 模式
+        m = re.search(r'def (\w+)\s*\(|(\w+)\s*\(.*\).*==|FAILED.*::test_(\w+)', harness_error)
+        if m:
+            failing_fn = next(g for g in m.groups() if g)
+
+    hint = f"函數 `{failing_fn}` 目前實作有誤，需要完整重寫。" if failing_fn else "請找出並修正失敗的函數。"
+    prompt = (
+        f"修正任務：{task}\n\n"
+        f"Harness 失敗訊息：\n{harness_error[-500:]}\n\n"
+        f"{hint}\n"
+        f"當前檔案內容：\n{file_content[:2000]}\n\n"
+        "直接輸出完整修正後的 Python 檔案內容，禁止輸出說明或 markdown fence。"
+    )
+    raw = ollama_call(prompt, model=model, timeout=300)
+    blocks = re.findall(r'```(?:python)?\n(.*?)```', raw, re.DOTALL)
+    result = blocks[-1].strip() if blocks else raw.strip()
+    if result and result != file_content.strip():
+        print(f"[DDI-Fallback] Researcher 直接重寫 {filename}（{len(result.splitlines())} 行）")
+    return result
+
+
 def run_local_ollama_ddi(
     task_with_context: str,
     files: list[str],
     work_dir: Path,
     model: str,
+    harness_error: str = "",
 ) -> tuple[str, bool]:
     """
     DDI Pipeline 主函式：Decompose → Draft → Integrate → Self-validate
     ─────────────────────────────────────────────────────────────────
     • Stage 1  Researcher 分解任務為原子子任務（每子任務 = 一個函數）
     • Stage 2  Researcher 逐子任務生成程式碼（小 context、精準輸出）
-    • Stage 3  Governor 將所有草稿整合為完整檔案
+    • Stage 3  Governor 將所有草稿整合為完整檔案（S1：注入 harness 錯誤）
     • Stage 4  Researcher 自我驗證是否符合需求，不過則針對性重試
+    • S2 Fallback  連續 2 次無差異則 Researcher 直接重寫失敗函數
 
     取代外部 aider binary，支援所有本地 ollama 模型與多檔案任務。
     task_complete 永遠回傳 False，由後續 harness 結果決定成敗。
@@ -1181,6 +1229,7 @@ def run_local_ollama_ddi(
     normalized_model = model.replace("ollama/", "", 1)
     output_log: list[str] = []
     any_changed = False
+    consecutive_no_change = 0  # S2：連續無差異計數器
 
     # 從帶有 context 的完整訊息中提取核心任務描述
     core_task = task_with_context
@@ -1245,10 +1294,11 @@ def run_local_ollama_ddi(
                     print(f"[DDI]   {subtask['function_name']}: 草稿空輸出，繼續")
 
             if completed_drafts:
-                # Stage 3: Integrate
+                # Stage 3: Integrate（S1：傳入 harness_error，幫助 Governor 精確定位）
                 print(f"[DDI] Stage 3: Governor 整合（{len(completed_drafts)}/{len(subtasks)} 草稿）...")
                 integrated_code = ddi_integrate(
-                    core_task, file_content, target_file, subtasks, completed_drafts
+                    core_task, file_content, target_file, subtasks, completed_drafts,
+                    harness_error=harness_error,
                 )
 
                 if integrated_code:
@@ -1277,7 +1327,7 @@ def run_local_ollama_ddi(
                             if retry_sub:
                                 new_draft = ddi_draft_subtask(
                                     retry_sub,
-                                    integrated_code,   # 用整合後的程式碼作為 context
+                                    integrated_code,
                                     {k: v for k, v in completed_drafts.items()
                                      if k != retry_id},
                                     extra_hint=issues_hint[:100],
@@ -1285,10 +1335,11 @@ def run_local_ollama_ddi(
                                 if new_draft:
                                     completed_drafts[retry_id] = new_draft
 
-                        # 重新整合（含修正後草稿）
+                        # 重新整合（含修正後草稿 + harness_error）
                         print("[DDI] 重新整合（含修正版草稿）...")
                         integrated_code = ddi_integrate(
-                            core_task, file_content, target_file, subtasks, completed_drafts
+                            core_task, file_content, target_file, subtasks, completed_drafts,
+                            harness_error=harness_error,
                         )
             else:
                 print("[DDI] Stage 2 全部空輸出，降級為單次生成")
@@ -1312,8 +1363,22 @@ def run_local_ollama_ddi(
                 )
                 any_changed = True
             else:
-                print(f"[DDI] {target_file}: 無差異，未寫入")
+                consecutive_no_change += 1
+                print(f"[DDI] {target_file}: 無差異，未寫入（連續 {consecutive_no_change} 次）")
                 output_log.append(f"[DDI] {target_file}: 無差異")
+                # S2：連續 2 次無差異且有 harness 錯誤 → Researcher 直接重寫
+                if consecutive_no_change >= 2 and harness_error:
+                    print(f"[DDI-S2] 連續無差異，啟動 Researcher fallback 直接重寫...")
+                    fallback_code = _ddi_no_change_fallback(
+                        core_task, file_content, target_file, harness_error, normalized_model
+                    )
+                    if fallback_code and fallback_code.strip() != file_content.strip():
+                        target_path.write_text(fallback_code, encoding="utf-8")
+                        lines = len(fallback_code.splitlines())
+                        print(f"[DDI-S2] 已寫入 {target_file}（{lines} 行）")
+                        output_log.append(f"[DDI-S2] {target_file}: fallback 重寫（{lines} 行）")
+                        any_changed = True
+                        consecutive_no_change = 0
         else:
             print(f"[DDI] {target_file}: 無法生成有效程式碼")
             output_log.append(f"[DDI] {target_file}: 生成失敗")
@@ -1329,10 +1394,12 @@ def run_aider(
     work_dir: Path,
     model: str,
     dry_run: bool = False,
+    harness_error: str = "",
 ) -> tuple[str, bool]:
     """
     呼叫 Aider CLI，回傳 (output, task_complete)
     task_complete = output 包含 TASK_COMPLETE
+    harness_error：上一輪 harness 失敗訊息，傳入 DDI Stage 3（S1）。
     """
     if dry_run:
         print("[Aider] DRY RUN，略過實際執行")
@@ -1380,7 +1447,8 @@ def run_aider(
 
     # 所有本地 ollama 模型統一走 DDI Pipeline（移除外部 aider binary 依賴）
     if normalized_model.startswith("ollama/"):
-        return run_local_ollama_ddi(task_with_context, files, work_dir, normalized_model)
+        return run_local_ollama_ddi(task_with_context, files, work_dir, normalized_model,
+                                    harness_error=harness_error)
 
     # ── 非 ollama 模型（保留 aider binary 路徑，作為雲端模型後備）──
     weak_model = ""
@@ -2006,7 +2074,8 @@ def main_loop(
 
         # ── Aider 執行 ────────────────────────────
         aider_out, task_complete = run_aider(
-            aider_message, active_files, work_dir, aider_model, dry_run
+            aider_message, active_files, work_dir, aider_model, dry_run,
+            harness_error=last_harness_output if sm.consecutive_fails > 0 else "",
         )
 
         # ── Git Diff ──────────────────────────────
