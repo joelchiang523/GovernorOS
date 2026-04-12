@@ -38,6 +38,7 @@ BASE_DIR = Path(__file__).parent
 MAIN_LOOP = BASE_DIR / "main_loop.py"
 DEFAULT_OUTPUT_DIR = BASE_DIR / "benchmark_reports"
 BENCHMARK_HISTORY_PATH = BASE_DIR / "memory" / "benchmark_history.jsonl"
+REPO_TIMELINE_PATH = BASE_DIR / "memory" / "repo_timeline.jsonl"
 DEFAULT_AIDER_MODEL = os.environ.get("OLLAMA_MODEL_AIDER", "ollama/qwen3.5:9b")
 
 
@@ -114,8 +115,14 @@ def run_case(case: dict, dry_run: bool = False) -> dict:
         cmd.append("--dry-run")
 
     complexity, task_timeout = complexity_score(case)
-    # GOVERNOR_FAST_MODE=1 跳過 MemPalace/Bridge Ollama 呼叫，大幅加速 benchmark 評估
-    bench_env = {**os.environ, "GOVERNOR_FAST_MODE": "1"}
+    # benchmark 保留 recall 路徑，避免把記憶檢索一起關掉而無法評估其效果。
+    bench_env = {
+        **os.environ,
+        "GOVERNOR_FAST_MODE": "1",
+        "SKIP_MEMPALACE": "1",
+        "SKIP_BRIDGE": "1",
+        "SKIP_RECALL": "0",
+    }
     try:
         result = subprocess.run(
             cmd,
@@ -293,6 +300,18 @@ def main() -> int:
         "total_rollbacks": report["total_rollbacks"],
         "report_json": str(json_path),
         "report_md": str(md_path),
+    })
+    append_jsonl(REPO_TIMELINE_PATH, {
+        "time": report["generated_at"],
+        "event_type": "benchmark_suite",
+        "summary": f"{report['suite']} pass_rate={report['pass_rate']:.2f} avg_iter={report['avg_iterations']:.2f}",
+        "details": {
+            "suite": report["suite"],
+            "pass_rate": report["pass_rate"],
+            "avg_iterations": report["avg_iterations"],
+            "failed": report["failed"],
+            "report_json": str(json_path),
+        },
     })
     print(f"[Benchmark] JSON 報告：{json_path}")
     print(f"[Benchmark] Markdown 報告：{md_path}")

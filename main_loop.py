@@ -78,8 +78,20 @@ DIFF_INTEL  = BASE_DIR / "git_diff_intel.py"
 L3_JSONL    = MEMORY_DIR / "L3_episodes.jsonl"
 L4_JSON     = MEMORY_DIR / "L4_knowledge.json"
 L5_JSON     = MEMORY_DIR / "L5_strategies.json"
+COMPILED_TRUTH_JSON = MEMORY_DIR / "compiled_truth.json"
 TRACE_DIR   = MEMORY_DIR / "traces"
 FAST_MODE   = os.environ.get("GOVERNOR_FAST_MODE", "0") == "1"
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    return os.environ.get(name, "1" if default else "0") == "1"
+
+
+# benchmark/批次執行可細控：保留向後相容的 FAST_MODE，
+# 但允許單獨保留 recall 以驗證其實際收益。
+SKIP_MEMPALACE = _env_flag("SKIP_MEMPALACE", FAST_MODE)
+SKIP_BRIDGE = _env_flag("SKIP_BRIDGE", FAST_MODE)
+SKIP_RECALL = _env_flag("SKIP_RECALL", FAST_MODE)
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
@@ -250,6 +262,8 @@ def normalize_tokens(text: str) -> set[str]:
 def memory_relevance_score(item: dict, task_tokens: set[str], file_tokens: set[str]) -> float:
     fields = [
         str(item.get("id", "")),
+        str(item.get("statement", "")),
+        str(item.get("category", "")),
         str(item.get("pattern", "")),
         str(item.get("condition", "")),
         str(item.get("action", "")),
@@ -270,6 +284,25 @@ def memory_relevance_score(item: dict, task_tokens: set[str], file_tokens: set[s
         + task_overlap * 1.5
         + file_overlap * 2.0
     )
+
+
+def select_relevant_truths(task: str, aider_files: list[str]) -> list[dict]:
+    compiled = load_json_list(COMPILED_TRUTH_JSON)
+    if isinstance(compiled, dict):
+        truth_items = compiled.get("truths", [])
+    else:
+        truth_items = []
+    task_tokens = normalize_tokens(task)
+    file_tokens = set()
+    for file_path in aider_files:
+        file_tokens |= normalize_tokens(file_path)
+        file_tokens |= normalize_tokens(Path(file_path).name)
+    ranked = sorted(
+        truth_items,
+        key=lambda item: memory_relevance_score(item, task_tokens, file_tokens),
+        reverse=True,
+    )
+    return ranked[:3]
 
 
 def select_relevant_memories(task: str, aider_files: list[str]) -> tuple[list[dict], list[dict]]:
@@ -1526,8 +1559,11 @@ Harness 失敗輸出（最後部分）：
 
 def dc(args: list[str]) -> None:
     """呼叫 dream_cycle.py 的快捷函式"""
-    if FAST_MODE and any(flag in args for flag in ("--update-mempalace", "--bridge")):
-        print(f"[DreamCycle] fast mode skip: {' '.join(args[:2])}")
+    if "--update-mempalace" in args and SKIP_MEMPALACE:
+        print("[DreamCycle] skip --update-mempalace")
+        return
+    if "--bridge" in args and SKIP_BRIDGE:
+        print("[DreamCycle] skip --bridge")
         return
     subprocess.run(
         [sys.executable, str(DREAM_CYCLE)] + args,
@@ -1627,9 +1663,9 @@ def recall_past_failures(task: str, similarity_threshold: float = 0.3) -> str:
     """
     呼叫 dream_cycle.py --recall 取得類似過去失敗案例，
     若有結果且相似度 > threshold，回傳記憶回溯文字；否則回傳空字串。
-    FAST_MODE 下略過（避免拖慢 benchmark）。
+    可透過 SKIP_RECALL=1 關閉；benchmark 預設保留以驗證 recall 效果。
     """
-    if FAST_MODE:
+    if SKIP_RECALL:
         return ""
     try:
         result = subprocess.run(
@@ -1657,7 +1693,8 @@ def recall_past_failures(task: str, similarity_threshold: float = 0.3) -> str:
             task_excerpt = r.get("task", "")[:60]
             failure_mode = r.get("failure_mode", "")
             root_cause = r.get("root_cause", "")
-            lines.append(f"- {task_excerpt}: {failure_mode} → {root_cause}")
+            method = r.get("method", "")
+            lines.append(f"- {task_excerpt}: {failure_mode} → {root_cause}" + (f" [{method}]" if method else ""))
         return "\n".join(lines)
     except Exception as e:
         print(f"[Recall] 略過（{e}）")
@@ -1912,15 +1949,29 @@ def main_loop(
                 f"（避免：{item.get('avoid', '')}）"
             ),
         )
+        selected_truths = select_relevant_truths(task, active_files)
+        truth_section = format_memory_section(
+            "[Compiled Truth]",
+            selected_truths,
+            lambda item: (
+                f"- [{item.get('id', 'truth')} {item.get('category', 'truth')}] "
+                f"{item.get('statement', '')} (scope={item.get('scope', 'general')})"
+            ),
+        )
         is_local_qwen_aider = AIDER_MODEL_LOCAL.startswith("ollama/qwen3.5")
         if is_local_qwen_aider:
             compact_failure = sanitize_cli_text(last_harness_output[-700:], 700)
             compact_research = sanitize_cli_text(research_brief, 220)
+            compact_truth = sanitize_cli_text(
+                " | ".join(item.get("statement", "") for item in selected_truths[:2]),
+                220,
+            )
             aider_message = (
                 f"[ITER {iteration}/{max_iter}] 任務：{workflow_plan['parsed_task']['goal']}\n"
                 f"本輪範圍：{workflow_plan['active_label']} -> {', '.join(workflow_plan['active_files']) or '(none)'}\n"
                 f"驗收：{'; '.join(workflow_plan['parsed_task']['acceptance']) or harness_cmd}\n"
                 + (f"{recall_context}\n" if recall_context else "")
+                + (f"已編譯事實：{compact_truth}\n" if compact_truth else "")
                 + (f"研究提示：{compact_research}\n" if compact_research else "")
                 + (f"當前失敗：{compact_failure}\n" if compact_failure else "")
                 + "直接修改提供的檔案。\n"
@@ -1946,6 +1997,7 @@ def main_loop(
                 )
                 + (f"\n[Research Brief]\n{research_brief}\n" if research_brief else "")
                 + (f"\n[MemPalace]\n{mempalace}\n" if mempalace else "")
+                + (f"\n{truth_section}\n" if truth_section else "")
                 + (f"\n{l4_section}\n" if l4_section else "")
                 + (f"\n{l5_section}\n" if l5_section else "")
                 + (f"\n[上次 Harness 失敗]\n{last_harness_output[-600:]}\n"

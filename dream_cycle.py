@@ -43,14 +43,32 @@ PATHS = {
     "L3": MEMORY_DIR / "L3_episodes.jsonl",
     "L4": MEMORY_DIR / "L4_knowledge.json",
     "L5": MEMORY_DIR / "L5_strategies.json",
+    "COMPILED_TRUTH": MEMORY_DIR / "compiled_truth.json",
+    "REPO_TIMELINE": MEMORY_DIR / "repo_timeline.jsonl",
+    "RECALL_EMBED_CACHE": MEMORY_DIR / "recall_embed_cache.json",
+    "REGRESSION_GATE": MEMORY_DIR / "regression_gate.json",
     "WAKE_HISTORY": MEMORY_DIR / "wake_history.jsonl",
     "STRATEGY_HISTORY": MEMORY_DIR / "strategy_history.jsonl",
     "BENCHMARK_HISTORY": MEMORY_DIR / "benchmark_history.jsonl",
+    "SELF_OPT_CONFIG": MEMORY_DIR / "self_optimization_config.json",
+    "SELF_OPT_HISTORY": MEMORY_DIR / "self_optimization_history.jsonl",
+    "SELF_OPT_REPORT": MEMORY_DIR / "self_optimization_report.json",
 }
 EXPORT_DIR = BASE_DIR / "exports"
 TRACE_ROOT = MEMORY_DIR / "traces"
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
+OLLAMA_EMBED_FALLBACK_URL = "http://localhost:11434/api/embeddings"
+OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_MODEL_EMBED", "nomic-embed-text")
+OLLAMA_EMBED_MODEL_CANDIDATES = [
+    model.strip()
+    for model in os.environ.get(
+        "OLLAMA_MODEL_EMBED_CANDIDATES",
+        f"{OLLAMA_EMBED_MODEL},mxbai-embed-large,bge-m3"
+    ).split(",")
+    if model.strip()
+]
 
 # ── 雙模型分工 ────────────────────────────────────────────
 # Governor：主控 / 判斷 / 治理 / 複核（穩定、規則感強）
@@ -66,7 +84,7 @@ OLLAMA_MODEL_RESEARCHER = os.environ.get(
 OLLAMA_MODEL = OLLAMA_MODEL_GOVERNOR
 
 # 門檻設定
-THRESHOLDS = {
+DEFAULT_THRESHOLDS = {
     "episode_min_score":      2,      # L3 進驗證池最低分（調低以允許失敗 episode 流入 L4）
     "l3_to_l4_min_count":     2,      # 同類規律出現幾次才升 L4（2 次即可萃取規律）
     "l4_to_l5_min_conf":      0.75,   # L4 升 L5 最低 confidence
@@ -84,6 +102,120 @@ THRESHOLDS = {
     "strategy_demote_ratio":  0.45,   # strategy scorer 降權門檻
     "strategy_min_uses":      3,      # strategy scorer 最低樣本數
 }
+
+THRESHOLD_BOUNDS = {
+    "episode_min_score":      (1, 6),
+    "l3_to_l4_min_count":     (2, 5),
+    "l4_to_l5_min_conf":      (0.60, 0.85),
+    "wake_l4_min_conf":       (0.60, 0.85),
+    "wake_l5_min_conf":       (0.65, 0.90),
+    "decay_days":             (14, 90),
+    "decay_amount":           (0.01, 0.10),
+    "inactive_threshold":     (0.30, 0.70),
+    "retire_days":            (60, 365),
+    "fail_ratio_threshold":   (0.25, 0.60),
+    "conflict_overlap":       (0.30, 0.80),
+    "max_wake_tokens":        (200, 1200),
+    "decay_warning_days":     (3, 21),
+    "strategy_promote_ratio": (0.60, 0.85),
+    "strategy_demote_ratio":  (0.35, 0.60),
+    "strategy_min_uses":      (2, 8),
+}
+
+DEFAULT_SETTINGS = {
+    "bridge_auto_sleep_interval": 10,
+}
+
+SETTING_BOUNDS = {
+    "bridge_auto_sleep_interval": (3, 20),
+}
+
+
+def _clamp_threshold_value(key: str, value):
+    if key not in THRESHOLD_BOUNDS:
+        return value
+    lo, hi = THRESHOLD_BOUNDS[key]
+    if isinstance(lo, int) and isinstance(hi, int):
+        return max(lo, min(hi, int(round(float(value)))))
+    return round(max(float(lo), min(float(hi), float(value))), 3)
+
+
+def _load_runtime_threshold_overrides() -> dict:
+    path = PATHS["SELF_OPT_CONFIG"]
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        print(f"[WARN] 自我優化設定檔 JSON 解析失敗：{path}")
+        return {}
+    raw = payload.get("overrides", payload if isinstance(payload, dict) else {})
+    overrides = {}
+    for key, value in raw.items():
+        if key in DEFAULT_THRESHOLDS:
+            overrides[key] = _clamp_threshold_value(key, value)
+    return overrides
+
+
+def _clamp_setting_value(key: str, value):
+    if key not in SETTING_BOUNDS:
+        return value
+    lo, hi = SETTING_BOUNDS[key]
+    return max(lo, min(hi, int(round(float(value)))))
+
+
+def _load_runtime_settings() -> dict:
+    path = PATHS["SELF_OPT_CONFIG"]
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    raw = payload.get("settings", {}) if isinstance(payload, dict) else {}
+    settings = {}
+    for key, value in raw.items():
+        if key in DEFAULT_SETTINGS:
+            settings[key] = _clamp_setting_value(key, value)
+    return settings
+
+
+def load_self_opt_config() -> dict:
+    default_payload = {
+        "version": 1,
+        "updated_at": "",
+        "overrides": {},
+        "settings": {},
+        "last_report": {},
+    }
+    path = PATHS["SELF_OPT_CONFIG"]
+    if not path.exists():
+        return dict(default_payload)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        print(f"[WARN] 自我優化設定檔 JSON 解析失敗：{path}")
+        return dict(default_payload)
+    if not isinstance(payload, dict):
+        return dict(default_payload)
+    merged = dict(default_payload)
+    merged.update(payload)
+    merged["overrides"] = merged.get("overrides", {}) if isinstance(merged.get("overrides"), dict) else {}
+    merged["settings"] = merged.get("settings", {}) if isinstance(merged.get("settings"), dict) else {}
+    merged["last_report"] = merged.get("last_report", {}) if isinstance(merged.get("last_report"), dict) else {}
+    return merged
+
+
+def save_self_opt_config(payload: dict) -> None:
+    payload = dict(payload)
+    payload["updated_at"] = datetime.now().isoformat()
+    save_json(PATHS["SELF_OPT_CONFIG"], payload)
+
+
+THRESHOLDS = dict(DEFAULT_THRESHOLDS)
+THRESHOLDS.update(_load_runtime_threshold_overrides())
+SETTINGS = dict(DEFAULT_SETTINGS)
+SETTINGS.update(_load_runtime_settings())
 
 # ─────────────────────────────────────────────
 # Cost Governor
@@ -152,6 +284,147 @@ def ollama_call(prompt: str, model: str = OLLAMA_MODEL, timeout: int = 600) -> s
         sys.exit(1)
 
 
+def _text_fingerprint(text: str) -> str:
+    import hashlib
+    return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _load_embed_cache() -> dict:
+    path = PATHS["RECALL_EMBED_CACHE"]
+    if not path.exists():
+        return {"model": OLLAMA_EMBED_MODEL, "items": {}, "last_warm_at": "", "last_status": "cold"}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"model": OLLAMA_EMBED_MODEL, "items": {}, "last_warm_at": "", "last_status": "cold"}
+    if not isinstance(payload, dict):
+        return {"model": OLLAMA_EMBED_MODEL, "items": {}, "last_warm_at": "", "last_status": "cold"}
+    if payload.get("model") != OLLAMA_EMBED_MODEL:
+        return {"model": OLLAMA_EMBED_MODEL, "items": {}, "last_warm_at": "", "last_status": "cold"}
+    payload["items"] = payload.get("items", {}) if isinstance(payload.get("items"), dict) else {}
+    return payload
+
+
+def _save_embed_cache(cache: dict) -> None:
+    cache = dict(cache)
+    cache["model"] = OLLAMA_EMBED_MODEL
+    save_json(PATHS["RECALL_EMBED_CACHE"], cache)
+
+
+def ollama_embed(texts: list[str], timeout: int = 60) -> list[list[float]] | None:
+    if not texts or not OLLAMA_EMBED_MODEL_CANDIDATES:
+        return None
+    for model_name in OLLAMA_EMBED_MODEL_CANDIDATES:
+        payloads = [
+            (OLLAMA_EMBED_URL, {"model": model_name, "input": texts}),
+            (OLLAMA_EMBED_FALLBACK_URL, {"model": model_name, "prompt": texts[0]} if len(texts) == 1 else None),
+        ]
+        for url, payload in payloads:
+            if payload is None:
+                continue
+            try:
+                resp = requests.post(url, json=payload, timeout=timeout)
+                resp.raise_for_status()
+                data = resp.json()
+                if "embeddings" in data and isinstance(data["embeddings"], list):
+                    return data["embeddings"]
+                if "embedding" in data and isinstance(data["embedding"], list):
+                    return [data["embedding"]]
+            except Exception:
+                continue
+    return None
+
+
+def _cosine_dense(vec_a: list[float], vec_b: list[float]) -> float:
+    import math
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = math.sqrt(sum(a * a for a in vec_a))
+    norm_b = math.sqrt(sum(b * b for b in vec_b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _get_cached_embeddings(texts: list[str], *, progress_label: str = "") -> tuple[dict[str, list[float]], bool]:
+    cache = _load_embed_cache()
+    items = cache.get("items", {})
+    result: dict[str, list[float]] = {}
+    missing: list[tuple[str, str]] = []
+    for text in texts:
+        key = _text_fingerprint(text)
+        if key in items and isinstance(items[key], list):
+            result[key] = items[key]
+        else:
+            missing.append((key, text))
+
+    if missing:
+        batch_size = 12
+        resolved_all = True
+        for start in range(0, len(missing), batch_size):
+            batch = missing[start:start + batch_size]
+            embeds = ollama_embed([text for _, text in batch], timeout=180)
+            if not embeds or len(embeds) != len(batch):
+                resolved_all = False
+                break
+            for (key, _), emb in zip(batch, embeds):
+                items[key] = emb
+                result[key] = emb
+            cache["items"] = items
+            cache["last_warm_at"] = datetime.now().isoformat()
+            cache["last_status"] = "warming"
+            _save_embed_cache(cache)
+            if progress_label:
+                print(
+                    f"[RecallEmbed] {progress_label} "
+                    f"{min(start + len(batch), len(missing))}/{len(missing)}"
+                )
+        if resolved_all:
+            cache["items"] = items
+            cache["last_warm_at"] = datetime.now().isoformat()
+            cache["last_status"] = "warm"
+            _save_embed_cache(cache)
+            return result, True
+        cache["last_status"] = "fallback"
+        _save_embed_cache(cache)
+        return result, False
+    return result, True
+
+
+def _recall_corpus_from_episodes(episodes: list[dict]) -> list[str]:
+    return [_episode_recall_text(ep) for ep in episodes]
+
+
+def cmd_warm_recall_cache(force: bool = False, limit: int = 0) -> None:
+    episodes = load_jsonl(PATHS["L3"])
+    if not episodes:
+        print("[RecallEmbed] 無 episodes，略過 cache 預熱")
+        return
+    if limit > 0:
+        episodes = episodes[:limit]
+    texts = _recall_corpus_from_episodes(episodes)
+    cache = _load_embed_cache()
+    if force:
+        cache = {"model": OLLAMA_EMBED_MODEL, "items": {}, "last_warm_at": "", "last_status": "cold"}
+        _save_embed_cache(cache)
+    embed_map, ok = _get_cached_embeddings(texts, progress_label="warming")
+    updated_cache = _load_embed_cache()
+    item_count = len(updated_cache.get("items", {}))
+    status = "ready" if ok else "fallback"
+    updated_cache["last_status"] = status
+    updated_cache["last_warm_at"] = datetime.now().isoformat()
+    _save_embed_cache(updated_cache)
+    append_timeline_event(
+        "warm_recall_cache",
+        f"recall embed cache 預熱 {item_count} 筆",
+        item_count=item_count,
+        status=status,
+        force=force,
+    )
+    print(f"[RecallEmbed] cache={item_count} status={status} resolved={len(embed_map)}")
+
+
 def parse_json_from_response(text: str) -> Optional[dict | list]:
     text = re.sub(r"```json\s*", "", text)
     text = re.sub(r"```\s*", "", text)
@@ -206,6 +479,16 @@ def load_jsonl(path: Path) -> list:
 def append_jsonl(path: Path, record: dict) -> None:
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def append_timeline_event(event_type: str, summary: str, **details) -> None:
+    record = {
+        "time": datetime.now().isoformat(),
+        "event_type": event_type,
+        "summary": sanitize_text(summary, 300),
+        "details": details,
+    }
+    append_jsonl(PATHS["REPO_TIMELINE"], record)
 
 
 def write_jsonl(path: Path, records: list[dict]) -> None:
@@ -393,9 +676,893 @@ def compute_effectiveness(item: dict, success_key: str, fail_key: str) -> tuple[
     return success, fail, ratio
 
 
+def _normalize_l4_ids(items: list[dict]) -> list[dict]:
+    """
+    在既有去重後重新編號 L4，保證 active / inactive / retired 各自的 id 唯一。
+    這是結構修復，不改變 confidence 與 evidence_count。
+    """
+    normalized = []
+    counter = 1
+    for item in items:
+        cloned = dict(item)
+        cloned["id"] = f"k_{counter:03d}"
+        counter += 1
+        normalized.append(cloned)
+    return normalized
+
+
+def count_duplicate_ids(items: list[dict]) -> int:
+    counts = {}
+    for item in items:
+        key = item.get("id", "")
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return sum(1 for value in counts.values() if value > 1)
+
+
+def summarize_self_optimization_state() -> dict:
+    episodes = load_jsonl(PATHS["L3"])
+    validated = [e for e in episodes if e.get("pool") == "validated"]
+    training_ready = [e for e in episodes if e.get("training_ready")]
+    l4 = load_json(PATHS["L4"])
+    l5 = load_json(PATHS["L5"])
+    l4_active = [item for item in l4 if item.get("status") == "active"]
+    l5_active = [item for item in l5 if item.get("status") == "active"]
+    benchmark_history = load_jsonl(PATHS["BENCHMARK_HISTORY"])
+    recent_bench = benchmark_history[-5:]
+    strategy_history = load_jsonl(PATHS["STRATEGY_HISTORY"])
+    recent_strategy = strategy_history[-50:]
+    regression_gate = load_json(PATHS["REGRESSION_GATE"])
+    recent_pass_rate = (
+        sum(float(item.get("pass_rate", 0.0)) for item in recent_bench) / len(recent_bench)
+        if recent_bench else 0.0
+    )
+    recent_avg_iterations = (
+        sum(float(item.get("avg_iterations", 0.0)) for item in recent_bench) / len(recent_bench)
+        if recent_bench else 0.0
+    )
+    strategy_success_ratio = (
+        sum(1 for item in recent_strategy if int(item.get("status", 1)) == 0) / len(recent_strategy)
+        if recent_strategy else 0.0
+    )
+    avg_l4_conf = (
+        sum(float(item.get("confidence", 0.0)) for item in l4_active) / len(l4_active)
+        if l4_active else 0.0
+    )
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "episode_count": len(episodes),
+        "validated_count": len(validated),
+        "training_ready_count": len(training_ready),
+        "l4_total": len(l4),
+        "l4_active": len(l4_active),
+        "l5_total": len(l5),
+        "l5_active": len(l5_active),
+        "l4_duplicate_ids": count_duplicate_ids(l4),
+        "avg_l4_confidence": round(avg_l4_conf, 4),
+        "benchmark_runs": len(benchmark_history),
+        "recent_benchmark_runs": len(recent_bench),
+        "recent_pass_rate": round(recent_pass_rate, 4),
+        "recent_avg_iterations": round(recent_avg_iterations, 4),
+        "strategy_events": len(strategy_history),
+        "recent_strategy_events": len(recent_strategy),
+        "recent_strategy_success_ratio": round(strategy_success_ratio, 4),
+        "regression_blocked": bool(regression_gate.get("blocked")) if isinstance(regression_gate, dict) else False,
+        "regression_count": len(regression_gate.get("regressions", [])) if isinstance(regression_gate, dict) else 0,
+        "thresholds": dict(THRESHOLDS),
+        "settings": dict(SETTINGS),
+    }
+
+
+def build_self_optimization_plan() -> dict:
+    state = summarize_self_optimization_state()
+    overrides: dict[str, float | int] = {}
+    settings: dict[str, int] = {}
+    actions: list[dict] = []
+    notes: list[str] = []
+
+    if state["l4_duplicate_ids"] > 0:
+        actions.append({
+            "type": "maintenance",
+            "name": "normalize_l4_ids",
+            "reason": f"L4 有 {state['l4_duplicate_ids']} 組重複 id，需先修復結構問題",
+        })
+
+    if state["l5_active"] == 0 and state["l4_active"] >= 5 and state["avg_l4_confidence"] >= 0.60:
+        proposed_l4_to_l5 = _clamp_threshold_value(
+            "l4_to_l5_min_conf",
+            min(float(THRESHOLDS["l4_to_l5_min_conf"]), 0.65),
+        )
+        proposed_wake_l5 = _clamp_threshold_value(
+            "wake_l5_min_conf",
+            max(float(proposed_l4_to_l5) + 0.05, 0.70),
+        )
+        overrides["l4_to_l5_min_conf"] = proposed_l4_to_l5
+        overrides["wake_l5_min_conf"] = proposed_wake_l5
+        notes.append("L5 長期為空，先降低升級門檻並保留較保守的 wake 門檻")
+
+    if state["recent_benchmark_runs"] >= 3 and state["recent_pass_rate"] < 0.60:
+        overrides["l3_to_l4_min_count"] = _clamp_threshold_value(
+            "l3_to_l4_min_count",
+            int(THRESHOLDS["l3_to_l4_min_count"]) - 1,
+        )
+        settings["bridge_auto_sleep_interval"] = _clamp_setting_value(
+            "bridge_auto_sleep_interval",
+            int(SETTINGS["bridge_auto_sleep_interval"]) - 2,
+        )
+        notes.append("近期 benchmark 通過率偏低，縮短學習回圈與 L3→L4 升級等待時間")
+
+    if state["recent_strategy_events"] >= 10 and state["recent_strategy_success_ratio"] < 0.50:
+        overrides["wake_l4_min_conf"] = _clamp_threshold_value(
+            "wake_l4_min_conf",
+            float(THRESHOLDS["wake_l4_min_conf"]) + 0.02,
+        )
+        overrides["strategy_min_uses"] = _clamp_threshold_value(
+            "strategy_min_uses",
+            int(THRESHOLDS["strategy_min_uses"]) + 1,
+        )
+        notes.append("近期被選中策略成功率偏低，暫時提高注入保守度與最小樣本數")
+
+    if state["recent_benchmark_runs"] >= 3 and state["recent_pass_rate"] >= 0.80 and state["recent_avg_iterations"] > 5.5:
+        settings["bridge_auto_sleep_interval"] = _clamp_setting_value(
+            "bridge_auto_sleep_interval",
+            int(SETTINGS["bridge_auto_sleep_interval"]) - 1,
+        )
+        notes.append("通過率尚可但平均迭代偏高，略微提升夢境整合頻率")
+
+    if state["regression_blocked"]:
+        overrides["wake_l4_min_conf"] = _clamp_threshold_value(
+            "wake_l4_min_conf",
+            float(THRESHOLDS["wake_l4_min_conf"]) + 0.03,
+        )
+        notes.append(f"benchmark regression gate 已阻擋 {state['regression_count']} 個 suite，暫時提高注入保守度")
+
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "state": state,
+        "proposed_overrides": overrides,
+        "proposed_settings": settings,
+        "actions": actions,
+        "notes": notes,
+        "safe_to_apply": bool(overrides or settings or actions),
+    }
+
+
+def cmd_self_optimize(apply: bool = False) -> None:
+    report = build_self_optimization_plan()
+    PATHS["SELF_OPT_REPORT"].write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    append_jsonl(PATHS["SELF_OPT_HISTORY"], {
+        "time": datetime.now().isoformat(),
+        "apply": apply,
+        "state": report["state"],
+        "proposed_overrides": report["proposed_overrides"],
+        "proposed_settings": report["proposed_settings"],
+        "actions": report["actions"],
+        "notes": report["notes"],
+    })
+
+    print("[SelfOptimize] 狀態摘要")
+    print(
+        f"  benchmarks={report['state']['benchmark_runs']} recent_pass_rate={report['state']['recent_pass_rate']:.2f} "
+        f"avg_iter={report['state']['recent_avg_iterations']:.2f}"
+    )
+    print(
+        f"  L4 active={report['state']['l4_active']} avg_conf={report['state']['avg_l4_confidence']:.2f} "
+        f"duplicate_ids={report['state']['l4_duplicate_ids']}"
+    )
+    print(f"  L5 active={report['state']['l5_active']} strategy_success={report['state']['recent_strategy_success_ratio']:.2f}")
+
+    if report["notes"]:
+        print("[SelfOptimize] 建議")
+        for note in report["notes"]:
+            print(f"  - {note}")
+
+    if report["proposed_overrides"]:
+        print("[SelfOptimize] 門檻建議")
+        for key, value in report["proposed_overrides"].items():
+            print(f"  - {key}: {THRESHOLDS.get(key)} -> {value}")
+
+    if report["proposed_settings"]:
+        print("[SelfOptimize] 設定建議")
+        for key, value in report["proposed_settings"].items():
+            print(f"  - {key}: {SETTINGS.get(key)} -> {value}")
+
+    if report["actions"]:
+        print("[SelfOptimize] 維護動作")
+        for action in report["actions"]:
+            print(f"  - {action['name']}: {action['reason']}")
+
+    if not apply:
+        print("[SelfOptimize] 分析完成（未套用）")
+        return
+
+    config = load_self_opt_config()
+    overrides = dict(config.get("overrides", {}))
+    settings = dict(config.get("settings", {}))
+    overrides.update(report["proposed_overrides"])
+    settings.update(report["proposed_settings"])
+    overrides = {key: _clamp_threshold_value(key, value) for key, value in overrides.items()}
+    settings = {key: _clamp_setting_value(key, value) for key, value in settings.items()}
+
+    l4_items = load_json(PATHS["L4"])
+    if any(action.get("name") == "normalize_l4_ids" for action in report["actions"]) and l4_items:
+        normalized = _normalize_l4_ids(l4_items)
+        save_json(PATHS["L4"], normalized)
+        print("[SelfOptimize] 已套用 L4 id 正規化")
+
+    config["overrides"] = overrides
+    config["settings"] = settings
+    config["last_report"] = {
+        "generated_at": report["generated_at"],
+        "notes": report["notes"],
+    }
+    save_self_opt_config(config)
+    append_timeline_event(
+        "self_optimize_apply",
+        "套用自我優化建議",
+        overrides=report["proposed_overrides"],
+        settings=report["proposed_settings"],
+        actions=[action.get("name", "") for action in report["actions"]],
+    )
+    print("[SelfOptimize] 已套用建議並更新自我優化設定")
+
+
+def _compact_scope(scope: str) -> str:
+    compact = sanitize_text(scope, 120)
+    return compact or "general"
+
+
+def _build_truth_entry(
+    *,
+    truth_id: str,
+    category: str,
+    statement: str,
+    scope: str,
+    evidence_count: int,
+    confidence: float,
+    sources: list[str],
+    source_links: list[str],
+    last_seen: str,
+) -> dict:
+    return {
+        "id": truth_id,
+        "category": category,
+        "statement": sanitize_text(statement, 240),
+        "scope": _compact_scope(scope),
+        "evidence_count": int(evidence_count),
+        "confidence": round(max(0.0, min(0.95, float(confidence))), 2),
+        "sources": sources[:10],
+        "source_links": source_links[:10],
+        "last_seen": last_seen,
+    }
+
+
+def _parse_iso_datetime(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    text = str(value).strip()
+    for candidate in [text, text.replace("Z", "+00:00")]:
+        try:
+            return datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+    try:
+        return datetime.strptime(text[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _truth_age_days(last_seen: str) -> Optional[int]:
+    parsed = _parse_iso_datetime(last_seen)
+    if not parsed:
+        return None
+    return max(0, (datetime.now() - parsed).days)
+
+
+def _apply_truth_staleness(truth: dict) -> dict:
+    item = dict(truth)
+    age_days = _truth_age_days(item.get("last_seen", ""))
+    item["age_days"] = age_days
+    item["stale"] = False
+    item["stale_level"] = ""
+    if age_days is None:
+        return item
+    if age_days >= 90:
+        item["stale"] = True
+        item["stale_level"] = "high"
+        item["confidence"] = round(max(0.2, float(item.get("confidence", 0.0)) - 0.15), 2)
+    elif age_days >= 45:
+        item["stale"] = True
+        item["stale_level"] = "medium"
+        item["confidence"] = round(max(0.25, float(item.get("confidence", 0.0)) - 0.08), 2)
+    elif age_days >= 21:
+        item["stale_level"] = "low"
+    return item
+
+
+def _normalized_truth_tokens(text: str) -> set[str]:
+    return {token for token in _tfidf_tokenize(text) if len(token) >= 2}
+
+
+def _has_opposite_pair(text_a: str, text_b: str) -> bool:
+    a = text_a.lower()
+    b = text_b.lower()
+    opposite_pairs = [
+        ("bfs", "dfs"),
+        ("stack", "queue"),
+        ("allow", "reject"),
+        ("enable", "disable"),
+        ("increase", "decrease"),
+        ("before", "after"),
+        ("sync", "async"),
+        ("append", "prepend"),
+    ]
+    return any(
+        (left in a and right in b) or (right in a and left in b)
+        for left, right in opposite_pairs
+    )
+
+
+def _detect_truth_contradictions(truths: list[dict]) -> list[dict]:
+    contradictions = []
+    for idx, left in enumerate(truths):
+        left_tokens = _normalized_truth_tokens(left.get("statement", ""))
+        for right in truths[idx + 1:]:
+            if left.get("category") != right.get("category"):
+                continue
+            if left.get("scope") != right.get("scope"):
+                continue
+            right_tokens = _normalized_truth_tokens(right.get("statement", ""))
+            if not left_tokens or not right_tokens:
+                continue
+            overlap = len(left_tokens & right_tokens) / max(1, len(left_tokens | right_tokens))
+            if overlap >= 0.45 and _has_opposite_pair(left.get("statement", ""), right.get("statement", "")):
+                contradictions.append({
+                    "left_id": left.get("id", ""),
+                    "right_id": right.get("id", ""),
+                    "scope": left.get("scope", ""),
+                    "category": left.get("category", ""),
+                    "overlap": round(overlap, 3),
+                })
+    return contradictions
+
+
+def build_compiled_truth() -> dict:
+    from collections import Counter
+
+    episodes = load_jsonl(PATHS["L3"])
+    l4 = load_json(PATHS["L4"])
+    l5 = load_json(PATHS["L5"])
+    benchmarks = load_jsonl(PATHS["BENCHMARK_HISTORY"])
+
+    success_eps = [ep for ep in episodes if int(ep.get("status", 1)) == 0]
+    fail_eps = [ep for ep in episodes if int(ep.get("status", 1)) != 0]
+
+    hotspot_stats: dict[str, dict[str, int | str]] = {}
+    for ep in episodes:
+        ep_files = ep.get("context", {}).get("files", []) or []
+        status = int(ep.get("status", 1))
+        for file_path in ep_files:
+            stats = hotspot_stats.setdefault(file_path, {"success": 0, "fail": 0, "last_seen": ep.get("time", "")})
+            if status == 0:
+                stats["success"] = int(stats["success"]) + 1
+            else:
+                stats["fail"] = int(stats["fail"]) + 1
+            stats["last_seen"] = ep.get("time", stats["last_seen"])
+
+    root_cause_counter = Counter(
+        ep.get("taxonomy", {}).get("root_cause", "")
+        for ep in fail_eps
+        if ep.get("taxonomy", {}).get("root_cause")
+    )
+    task_type_counter = Counter(
+        ep.get("workflow", {}).get("task_type", "")
+        for ep in episodes
+        if ep.get("workflow", {}).get("task_type")
+    )
+    rollback_counter = Counter(
+        ep.get("workflow", {}).get("rollback_reason", "")
+        for ep in fail_eps
+        if ep.get("workflow", {}).get("rollback_reason")
+    )
+
+    truths: list[dict] = []
+    truth_index = 1
+
+    for item in sorted(l4, key=lambda x: (float(x.get("confidence", 0.0)), int(x.get("use_count", 0))), reverse=True):
+        if item.get("status") != "active":
+            continue
+        truths.append(_build_truth_entry(
+            truth_id=f"truth_{truth_index:03d}",
+            category="knowledge_pattern",
+            statement=item.get("pattern", ""),
+            scope=item.get("scope", ""),
+            evidence_count=max(int(item.get("evidence_count", 0)), len(item.get("source_episodes", []))),
+            confidence=float(item.get("confidence", 0.0)),
+            sources=item.get("source_episodes", []),
+            source_links=[item.get("id", "")],
+            last_seen=item.get("updated_at", item.get("created_at", "")),
+        ))
+        truth_index += 1
+        if truth_index > 5:
+            break
+
+    for file_path, stats in sorted(hotspot_stats.items(), key=lambda kv: int(kv[1]["success"]) + int(kv[1]["fail"]), reverse=True)[:5]:
+        total = int(stats["success"]) + int(stats["fail"])
+        fail_ratio = (int(stats["fail"]) / total) if total else 0.0
+        truths.append(_build_truth_entry(
+            truth_id=f"truth_{truth_index:03d}",
+            category="file_hotspot",
+            statement=(
+                f"{file_path} 經常被改動，success={int(stats['success'])} fail={int(stats['fail'])}，"
+                f"需優先檢查其相依與測試影響"
+            ),
+            scope=file_path,
+            evidence_count=total,
+            confidence=0.55 + min(0.30, total * 0.03) - min(0.15, fail_ratio * 0.10),
+            sources=[file_path],
+            source_links=[],
+            last_seen=str(stats["last_seen"]),
+        ))
+        truth_index += 1
+
+    for root_cause, count in root_cause_counter.most_common(5):
+        truths.append(_build_truth_entry(
+            truth_id=f"truth_{truth_index:03d}",
+            category="failure_pattern",
+            statement=f"近期失敗常見根因：{root_cause}，處理前應先檢查對應 API、型別或測試假設",
+            scope="failure_handling",
+            evidence_count=count,
+            confidence=0.55 + min(0.25, count * 0.04),
+            sources=[root_cause],
+            source_links=[],
+            last_seen=fail_eps[-1].get("time", "") if fail_eps else "",
+        ))
+        truth_index += 1
+
+    for task_type, count in task_type_counter.most_common(3):
+        truths.append(_build_truth_entry(
+            truth_id=f"truth_{truth_index:03d}",
+            category="task_distribution",
+            statement=f"任務型別 {task_type} 近期出現頻率高，應維持對應 workflow 模板與檔案選擇規則",
+            scope=task_type,
+            evidence_count=count,
+            confidence=0.50 + min(0.20, count * 0.03),
+            sources=[task_type],
+            source_links=[],
+            last_seen=episodes[-1].get("time", "") if episodes else "",
+        ))
+        truth_index += 1
+
+    strategy_added = 0
+    for item in sorted(l5, key=lambda x: (int(x.get("success_count", 0)), float(x.get("confidence", 0.0))), reverse=True):
+        if item.get("status") != "active":
+            continue
+        total = int(item.get("success_count", 0)) + int(item.get("fail_count", 0))
+        if total <= 0:
+            continue
+        truths.append(_build_truth_entry(
+            truth_id=f"truth_{truth_index:03d}",
+            category="strategy_effective",
+            statement=f"當 {item.get('condition', '')} 時，優先 {item.get('action', '')}",
+            scope=item.get("scope", ""),
+            evidence_count=total,
+            confidence=float(item.get("confidence", 0.0)),
+            sources=[item.get("id", "")],
+            source_links=[item.get("id", "")],
+            last_seen=item.get("last_verified", item.get("updated_at", "")),
+        ))
+        truth_index += 1
+        strategy_added += 1
+        if strategy_added >= 3:
+            break
+
+    truths = [_apply_truth_staleness(item) for item in truths]
+    contradictions = _detect_truth_contradictions(truths)
+    contradiction_ids = {item["left_id"] for item in contradictions} | {item["right_id"] for item in contradictions}
+    stale_truths = [item for item in truths if item.get("stale")]
+
+    for item in truths:
+        if item.get("id") in contradiction_ids:
+            item["confidence"] = round(max(0.2, float(item.get("confidence", 0.0)) - 0.10), 2)
+            item["contradiction_flag"] = True
+        else:
+            item["contradiction_flag"] = False
+
+    truths.sort(
+        key=lambda item: (
+            item.get("contradiction_flag", False),
+            item.get("stale", False),
+            -float(item.get("confidence", 0.0)),
+            -int(item.get("evidence_count", 0)),
+        )
+    )
+
+    recent_bench = benchmarks[-5:]
+    pass_rate = (
+        sum(float(item.get("pass_rate", 0.0)) for item in recent_bench) / len(recent_bench)
+        if recent_bench else 0.0
+    )
+    avg_iterations = (
+        sum(float(item.get("avg_iterations", 0.0)) for item in recent_bench) / len(recent_bench)
+        if recent_bench else 0.0
+    )
+
+    return {
+        "version": 1,
+        "generated_at": datetime.now().isoformat(),
+        "summary": {
+            "episode_count": len(episodes),
+            "success_count": len(success_eps),
+            "failure_count": len(fail_eps),
+            "active_l4": len([item for item in l4 if item.get("status") == "active"]),
+            "active_l5": len([item for item in l5 if item.get("status") == "active"]),
+            "stale_truths": len(stale_truths),
+            "contradictions": len(contradictions),
+            "recent_benchmark_pass_rate": round(pass_rate, 4),
+            "recent_benchmark_avg_iterations": round(avg_iterations, 4),
+        },
+        "benchmark_trend": {
+            "runs": len(benchmarks),
+            "recent_pass_rate": round(pass_rate, 4),
+            "recent_avg_iterations": round(avg_iterations, 4),
+        },
+        "top_root_causes": [{"root_cause": key, "count": value} for key, value in root_cause_counter.most_common(5)],
+        "top_task_types": [{"task_type": key, "count": value} for key, value in task_type_counter.most_common(5)],
+        "rollback_reasons": [{"reason": key, "count": value} for key, value in rollback_counter.most_common(5)],
+        "contradictions": contradictions[:10],
+        "stale_truths": [
+            {
+                "id": item.get("id", ""),
+                "age_days": item.get("age_days"),
+                "stale_level": item.get("stale_level", ""),
+                "statement": item.get("statement", ""),
+            }
+            for item in stale_truths[:10]
+        ],
+        "truths": truths[:20],
+    }
+
+
+def cmd_compile_truth() -> None:
+    payload = build_compiled_truth()
+    save_json(PATHS["COMPILED_TRUTH"], payload)
+    append_timeline_event(
+        "compile_truth",
+        f"重新編譯 truth，產出 {len(payload.get('truths', []))} 條可用規律",
+        truth_count=len(payload.get("truths", [])),
+        recent_pass_rate=payload.get("benchmark_trend", {}).get("recent_pass_rate", 0.0),
+        recent_avg_iterations=payload.get("benchmark_trend", {}).get("recent_avg_iterations", 0.0),
+        stale_truths=payload.get("summary", {}).get("stale_truths", 0),
+        contradictions=payload.get("summary", {}).get("contradictions", 0),
+    )
+    print(
+        f"[CompiledTruth] 已更新，共 {len(payload.get('truths', []))} 條 truth | "
+        f"recent_pass_rate={payload.get('benchmark_trend', {}).get('recent_pass_rate', 0.0):.2f} "
+        f"stale={payload.get('summary', {}).get('stale_truths', 0)} "
+        f"contradictions={payload.get('summary', {}).get('contradictions', 0)}"
+    )
+
+
+def build_regression_gate() -> dict:
+    history = load_jsonl(PATHS["BENCHMARK_HISTORY"])
+    suites: dict[str, list[dict]] = {}
+    for item in history:
+        suites.setdefault(item.get("suite", "unknown"), []).append(item)
+
+    regressions = []
+    for suite, records in suites.items():
+        if len(records) < 2:
+            continue
+        latest = records[-1]
+        baseline_records = records[-4:-1] if len(records) >= 4 else records[:-1]
+        if not baseline_records:
+            continue
+        baseline_pass = sum(float(item.get("pass_rate", 0.0)) for item in baseline_records) / len(baseline_records)
+        baseline_iter = sum(float(item.get("avg_iterations", 0.0)) for item in baseline_records) / len(baseline_records)
+        latest_pass = float(latest.get("pass_rate", 0.0))
+        latest_iter = float(latest.get("avg_iterations", 0.0))
+        pass_drop = round(baseline_pass - latest_pass, 4)
+        iter_rise = round(latest_iter - baseline_iter, 4)
+        severe = pass_drop >= 0.10 or iter_rise >= 1.5
+        if severe:
+            regressions.append({
+                "suite": suite,
+                "baseline_pass_rate": round(baseline_pass, 4),
+                "latest_pass_rate": round(latest_pass, 4),
+                "pass_drop": pass_drop,
+                "baseline_avg_iterations": round(baseline_iter, 4),
+                "latest_avg_iterations": round(latest_iter, 4),
+                "iteration_rise": iter_rise,
+                "latest_report": latest.get("report_json", ""),
+            })
+
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "history_count": len(history),
+        "regressions": regressions,
+        "blocked": bool(regressions),
+    }
+
+
+def cmd_regression_gate() -> None:
+    report = build_regression_gate()
+    save_json(PATHS["REGRESSION_GATE"], report)
+    append_timeline_event(
+        "regression_gate",
+        f"benchmark regression gate blocked={report['blocked']}",
+        regressions=report.get("regressions", []),
+    )
+    if report["regressions"]:
+        print(f"[RegressionGate] blocked=1 regressions={len(report['regressions'])}")
+        for item in report["regressions"]:
+            print(
+                f"  - {item['suite']}: pass_drop={item['pass_drop']:.2f} "
+                f"iter_rise={item['iteration_rise']:.2f}"
+            )
+    else:
+        print("[RegressionGate] blocked=0 regressions=0")
+
+
+# ─────────────────────────────────────────────
+# Phase 1+2：Pipeline 自我診斷（--diagnose / --diagnose-suggest）
+# ─────────────────────────────────────────────
+
+def _collect_trace_signals() -> list[dict]:
+    """掃描所有 trace，收集 pipeline-level 訊號。"""
+    signals = []
+    if not TRACE_ROOT.exists():
+        return signals
+    for td in sorted(TRACE_ROOT.iterdir()):
+        if not td.is_dir():
+            continue
+        run_meta_path = td / "run_meta.json"
+        result_path   = td / "result.json"
+        if not run_meta_path.exists():
+            continue
+        try:
+            run_meta = json.loads(run_meta_path.read_text(encoding="utf-8"))
+            result   = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else {}
+        except Exception:
+            continue
+        for iter_dir in sorted(td.glob("iter_*_action")):
+            meta_path    = iter_dir / "meta.json"
+            harness_path = iter_dir / "harness_output.txt"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            harness_out = harness_path.read_text(encoding="utf-8", errors="replace") if harness_path.exists() else ""
+            signals.append({
+                "run_id":        run_meta.get("run_id", ""),
+                "task":          run_meta.get("task", "")[:80],
+                "iteration":     meta.get("iteration", 0),
+                "lines_changed": meta.get("lines_changed", -1),
+                "harness_pass":  meta.get("harness_pass", False),
+                "failure_mode":  meta.get("failure_mode", ""),
+                "root_cause":    meta.get("root_cause", ""),
+                "final_state":   result.get("state", ""),
+                "final_pass":    result.get("final_harness_pass", False),
+                "harness_tail":  harness_out[-300:],
+            })
+    return signals
+
+
+def _find_pipeline_patterns(signals: list[dict]) -> list[dict]:
+    """從 trace 訊號中萃取 pipeline-level 失敗模式。"""
+    from collections import Counter
+    patterns = []
+
+    # P001：無差異死循環（lines_changed==0 且 harness fail）
+    no_change_fails = [s for s in signals if s["lines_changed"] == 0 and not s["harness_pass"]]
+    if len(no_change_fails) >= 5:
+        tasks = list({s["task"][:50] for s in no_change_fails[:3]})
+        patterns.append({
+            "pattern_id": "P001",
+            "type": "ddi_no_change_loop",
+            "description": (
+                f"DDI integrate 產生無差異卻 harness 仍失敗，共 {len(no_change_fails)} 次。"
+                " 每次迭代浪費 integrate 時間，最終 timeout。"
+            ),
+            "evidence_count": len(no_change_fails),
+            "example_tasks": tasks,
+            "suggested_fix": (
+                "迭代開始時若上一輪 lines_changed==0，將 harness 錯誤摘要注入 Stage 3 prompt；"
+                "同時偵測連續 2 次無差異則 fallback 到 Researcher 直接重寫失敗函數。"
+            ),
+            "scope": "pipeline/ddi",
+            "confidence": min(0.75, 0.50 + len(no_change_fails) * 0.01),
+        })
+
+    # P002：同一任務反覆失敗
+    task_fails = Counter(s["task"][:60] for s in signals if not s["harness_pass"])
+    for task, count in task_fails.most_common(3):
+        if count >= 8:
+            patterns.append({
+                "pattern_id": f"P002",
+                "type": "repeated_task_failure",
+                "description": (
+                    f"任務「{task[:45]}」已累積 {count} 次失敗 iter，存在系統性根因。"
+                ),
+                "evidence_count": count,
+                "example_tasks": [task],
+                "suggested_fix": (
+                    "在 Recall 注入相關失敗案例；若 DDI scope 過窄則補全缺漏子任務（已修）；"
+                    "考慮增加 autoresearch 觸發頻率。"
+                ),
+                "scope": "pipeline/task_routing",
+                "confidence": min(0.72, 0.50 + count * 0.02),
+            })
+            break  # 只報最嚴重一個
+
+    # P003：高 rollback 率
+    rollback_iters = [s for s in signals if s.get("root_cause") == "rollback"]
+    total_iters = len(signals)
+    if total_iters > 0 and len(rollback_iters) / total_iters > 0.10:
+        patterns.append({
+            "pattern_id": "P003",
+            "type": "high_rollback_rate",
+            "description": (
+                f"rollback 佔所有 iter 的 {len(rollback_iters)/total_iters:.0%}"
+                f"（{len(rollback_iters)}/{total_iters}）。"
+            ),
+            "evidence_count": len(rollback_iters),
+            "example_tasks": [],
+            "suggested_fix": "增加 autoresearch brief 的細節程度；確保 harness 失敗訊息完整傳入 prompt。",
+            "scope": "pipeline/state_machine",
+            "confidence": 0.65,
+        })
+
+    return patterns
+
+
+def _diagnose_suggest(patterns: list[dict]) -> None:
+    """Phase 2：用 Researcher 對每個 pipeline 問題產生具體修正建議，寫入 system_improvements.json。"""
+    if not patterns:
+        return
+    print("[Diagnose] Phase 2：Researcher 生成修正建議...")
+    pattern_text = "\n".join(
+        f"問題 {i+1}（{p['pattern_id']}）：{p['type']}\n"
+        f"  描述：{p['description']}\n"
+        f"  初步建議：{p['suggested_fix']}"
+        for i, p in enumerate(patterns)
+    )
+    prompt = f"""你是 AI 系統自我診斷工程師。以下是從 trace 分析發現的 pipeline-level 問題：
+
+{pattern_text}
+
+請針對每個問題提出具體程式碼修正方案，格式為 JSON 陣列：
+[
+  {{
+    "pattern_id": "P001",
+    "file": "main_loop.py",
+    "location": "函數名稱與大約行號",
+    "fix_type": "新增邏輯|修改判斷|新增 fallback",
+    "fix_description": "具體說明改哪幾行加什麼邏輯（100 字以內）",
+    "priority": "high|medium|low",
+    "risk": "low|medium|high"
+  }}
+]
+只輸出 JSON 陣列。"""
+
+    raw = ollama_call(prompt, model=OLLAMA_MODEL_RESEARCHER, timeout=120)
+    suggestions = parse_json_from_response(raw)
+    if not suggestions or not isinstance(suggestions, list):
+        print("[Diagnose] Researcher 未能產生有效建議")
+        return
+
+    imp_path = MEMORY_DIR / "system_improvements.json"
+    existing: list[dict] = []
+    if imp_path.exists():
+        try:
+            existing = json.loads(imp_path.read_text(encoding="utf-8"))
+        except Exception:
+            existing = []
+
+    now = datetime.now().isoformat()
+    for s in suggestions:
+        s["generated_at"] = now
+        s["status"] = "pending"
+        existing.append(s)
+    imp_path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[Diagnose] 已生成 {len(suggestions)} 條修正建議 → memory/system_improvements.json")
+    for s in suggestions:
+        pri = s.get("priority", "?")
+        desc = s.get("fix_description", "")[:65]
+        print(f"  [{pri}] {s.get('file','')} — {desc}")
+
+
+def cmd_diagnose(suggest: bool = False) -> None:
+    """
+    Phase 1：掃描所有 trace → 萃取 pipeline-level 失敗模式 → 寫入 L4 scope=pipeline。
+    Phase 2（--suggest）：呼叫 Researcher 產生具體程式碼修正建議。
+    """
+    print("[Diagnose] 掃描 traces...")
+    signals = _collect_trace_signals()
+    n_traces = len({s["run_id"] for s in signals})
+    print(f"[Diagnose] {n_traces} 個 trace，{len(signals)} 個 iter 訊號")
+
+    patterns = _find_pipeline_patterns(signals)
+    if not patterns:
+        print("[Diagnose] 未發現顯著 pipeline 問題")
+        return
+
+    print(f"\n[Diagnose] 發現 {len(patterns)} 個 pipeline 問題：")
+    for p in patterns:
+        print(f"  [{p['pattern_id']}] {p['type']}  evidence={p['evidence_count']}  conf={p['confidence']:.2f}")
+        print(f"    → {p['description'][:80]}")
+        print(f"    修正：{p['suggested_fix'][:80]}")
+
+    # 寫入 L4 scope=pipeline（避免重複）
+    l4 = load_json(PATHS["L4"])
+    existing_ids = {item["id"] for item in l4}
+    added = 0
+    for p in patterns:
+        pid = f"kp_{p['pattern_id'].lower()}"
+        if pid in existing_ids:
+            # 更新 evidence_count
+            for item in l4:
+                if item["id"] == pid:
+                    item["evidence_count"] = p["evidence_count"]
+                    item["confidence"] = p["confidence"]
+            continue
+        l4.append({
+            "id": pid,
+            "pattern": p["description"],
+            "scope": p["scope"],
+            "evidence_count": p["evidence_count"],
+            "confidence": p["confidence"],
+            "suggested_fix": p["suggested_fix"],
+            "source": "diagnose",
+            "status": "active",
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+        })
+        existing_ids.add(pid)
+        added += 1
+
+    save_json(PATHS["L4"], l4)
+    print(f"\n[Diagnose] L4 pipeline entries：新增 {added}，更新 {len(patterns)-added}")
+
+    # 儲存診斷報告
+    report = {
+        "generated_at": datetime.now().isoformat(),
+        "traces_scanned": n_traces,
+        "signals_collected": len(signals),
+        "patterns": patterns,
+    }
+    rpt_path = MEMORY_DIR / "diagnose_report.json"
+    rpt_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[Diagnose] 報告 → {rpt_path}")
+
+    if suggest:
+        _diagnose_suggest(patterns)
+
+
 def cmd_score_strategies() -> None:
     print("[StrategyScorer] 開始評估 L4/L5 effectiveness...")
     updates = {"l4_promoted": [], "l4_demoted": [], "l5_promoted": [], "l5_demoted": [], "l5_inactive": []}
+    compiled_truth = load_json(PATHS["COMPILED_TRUTH"])
+    regression_gate = load_json(PATHS["REGRESSION_GATE"])
+    gate_blocked = bool(regression_gate.get("blocked")) if isinstance(regression_gate, dict) else False
+    truth_items = compiled_truth.get("truths", []) if isinstance(compiled_truth, dict) else []
+    stale_links = {
+        link
+        for item in truth_items
+        if item.get("stale")
+        for link in item.get("source_links", [])
+        if link
+    }
+    contradiction_links = {
+        link
+        for item in truth_items
+        if item.get("contradiction_flag")
+        for link in item.get("source_links", [])
+        if link
+    }
 
     l4 = load_json(PATHS["L4"])
     for item in l4:
@@ -404,7 +1571,7 @@ def cmd_score_strategies() -> None:
         if total < THRESHOLDS["strategy_min_uses"]:
             continue
         old_conf = float(item.get("confidence", 0.0))
-        if ratio >= THRESHOLDS["strategy_promote_ratio"]:
+        if ratio >= THRESHOLDS["strategy_promote_ratio"] and not gate_blocked:
             item["confidence"] = round(min(0.95, old_conf + 0.03), 3)
             item["last_scored"] = datetime.now().isoformat()
             item["score_note"] = f"promoted ratio={ratio:.2f} total={total}"
@@ -416,6 +1583,18 @@ def cmd_score_strategies() -> None:
             item["score_note"] = f"demoted ratio={ratio:.2f} total={total}"
             updates["l4_demoted"].append(item["id"])
             print(f"  [L4↓] {item['id']} {old_conf:.2f} -> {item['confidence']:.2f} ratio={ratio:.0%}")
+        if item.get("id") in stale_links:
+            item["confidence"] = round(max(0.25, float(item.get("confidence", 0.0)) - 0.03), 3)
+            item["score_note"] = f"{item.get('score_note', '')} stale_truth".strip()
+            if item["id"] not in updates["l4_demoted"]:
+                updates["l4_demoted"].append(item["id"])
+            print(f"  [L4△] {item['id']} stale truth -> {item['confidence']:.2f}")
+        if item.get("id") in contradiction_links:
+            item["confidence"] = round(max(0.20, float(item.get("confidence", 0.0)) - 0.05), 3)
+            item["score_note"] = f"{item.get('score_note', '')} contradiction_truth".strip()
+            if item["id"] not in updates["l4_demoted"]:
+                updates["l4_demoted"].append(item["id"])
+            print(f"  [L4⚠] {item['id']} contradiction truth -> {item['confidence']:.2f}")
     save_json(PATHS["L4"], l4)
 
     l5 = load_json(PATHS["L5"])
@@ -425,7 +1604,7 @@ def cmd_score_strategies() -> None:
         if total < THRESHOLDS["strategy_min_uses"]:
             continue
         old_conf = float(item.get("confidence", 0.0))
-        if ratio >= THRESHOLDS["strategy_promote_ratio"]:
+        if ratio >= THRESHOLDS["strategy_promote_ratio"] and not gate_blocked:
             item["confidence"] = round(min(0.98, old_conf + 0.04), 3)
             item["last_scored"] = datetime.now().isoformat()
             item["score_note"] = f"promoted ratio={ratio:.2f} total={total}"
@@ -441,22 +1620,60 @@ def cmd_score_strategies() -> None:
                 item["status"] = "inactive"
                 updates["l5_inactive"].append(item["id"])
                 print("       -> inactive")
+        if item.get("id") in stale_links:
+            item["confidence"] = round(max(0.25, float(item.get("confidence", 0.0)) - 0.03), 3)
+            item["score_note"] = f"{item.get('score_note', '')} stale_truth".strip()
+            if item["id"] not in updates["l5_demoted"]:
+                updates["l5_demoted"].append(item["id"])
+            print(f"  [L5△] {item['id']} stale truth -> {item['confidence']:.2f}")
+        if item.get("id") in contradiction_links:
+            item["confidence"] = round(max(0.20, float(item.get("confidence", 0.0)) - 0.05), 3)
+            item["score_note"] = f"{item.get('score_note', '')} contradiction_truth".strip()
+            if item["id"] not in updates["l5_demoted"]:
+                updates["l5_demoted"].append(item["id"])
+            print(f"  [L5⚠] {item['id']} contradiction truth -> {item['confidence']:.2f}")
     save_json(PATHS["L5"], l5)
 
     total_changes = sum(len(v) for v in updates.values())
     if total_changes == 0:
-        print("[StrategyScorer] 無足夠樣本或暫無需調整的策略")
+        if gate_blocked:
+            print("[StrategyScorer] regression gate blocked，且目前無可降權項目")
+        else:
+            print("[StrategyScorer] 無足夠樣本或暫無需調整的策略")
         return
+    append_timeline_event(
+        "score_strategies",
+        f"strategy scorer 調整 {total_changes} 項",
+        updates=updates,
+        threshold_promote=THRESHOLDS["strategy_promote_ratio"],
+        threshold_demote=THRESHOLDS["strategy_demote_ratio"],
+        gate_blocked=gate_blocked,
+    )
     print(f"[StrategyScorer] 完成，共調整 {total_changes} 項")
 
 
 # ─────────────────────────────────────────────
-# --recall：TF-IDF 回憶相似過去 episodes
+# --recall：Hybrid Vector Recall 回憶相似過去 episodes
 # ─────────────────────────────────────────────
 
 def _tfidf_tokenize(text: str) -> list[str]:
     """簡單分詞：lowercase，以非英數字元分割，去除空 token"""
     return [t for t in re.split(r'[^\w]+', text.lower()) if t]
+
+
+def _semantic_tokenize(text: str) -> list[str]:
+    """
+    混合語意 token：
+    - 一般詞 token
+    - 壓平後字元 trigram
+    這不是外部 embedding，但對 API 名稱、函式名、短語變體比純 TF-IDF 更穩。
+    """
+    tokens = _tfidf_tokenize(text)
+    compact = re.sub(r"\s+", "", text.lower())
+    compact = re.sub(r"[^\w\u4e00-\u9fff]+", "", compact)
+    if len(compact) >= 3:
+        tokens.extend(compact[i:i + 3] for i in range(len(compact) - 2))
+    return tokens
 
 
 def _build_tfidf(corpus: list[str]) -> tuple[list[dict], dict]:
@@ -473,6 +1690,35 @@ def _build_tfidf(corpus: list[str]) -> tuple[list[dict], dict]:
         return [], {}
 
     tokenized = [_tfidf_tokenize(doc) for doc in corpus]
+    df: dict[str, int] = {}
+    for tokens in tokenized:
+        for term in set(tokens):
+            df[term] = df.get(term, 0) + 1
+
+    idf: dict[str, float] = {
+        term: math.log((N + 1) / (count + 1)) + 1.0
+        for term, count in df.items()
+    }
+
+    vectors: list[dict[str, float]] = []
+    for tokens in tokenized:
+        tf = Counter(tokens)
+        total = len(tokens) or 1
+        vec = {term: (count / total) * idf.get(term, 1.0) for term, count in tf.items()}
+        vectors.append(vec)
+
+    return vectors, idf
+
+
+def _build_tfidf_with_tokenizer(corpus: list[str], tokenizer) -> tuple[list[dict], dict]:
+    import math
+    from collections import Counter
+
+    N = len(corpus)
+    if N == 0:
+        return [], {}
+
+    tokenized = [tokenizer(doc) for doc in corpus]
     df: dict[str, int] = {}
     for tokens in tokenized:
         for term in set(tokens):
@@ -515,10 +1761,46 @@ def _tfidf_query_vector(query_tokens: list[str], idf: dict[str, float]) -> dict[
     return {term: (count / total) * idf.get(term, 1.0) for term, count in tf.items()}
 
 
+def _episode_recall_text(ep: dict) -> str:
+    taxonomy = ep.get("taxonomy", {})
+    workflow = ep.get("workflow", {})
+    files = ep.get("context", {}).get("files", []) or []
+    parts = [
+        ep.get("task", ""),
+        ep.get("diff_summary", ""),
+        taxonomy.get("failure_mode", ""),
+        taxonomy.get("root_cause", ""),
+        taxonomy.get("patch_type", ""),
+        workflow.get("task_type", ""),
+        workflow.get("strategy_note", ""),
+        " ".join(files),
+    ]
+    return " ".join(part for part in parts if part)
+
+
+def _metadata_overlap_score(query_tokens: set[str], ep: dict) -> float:
+    taxonomy = ep.get("taxonomy", {})
+    workflow = ep.get("workflow", {})
+    files = ep.get("context", {}).get("files", []) or []
+    meta_blob = " ".join([
+        taxonomy.get("failure_mode", ""),
+        taxonomy.get("root_cause", ""),
+        taxonomy.get("patch_type", ""),
+        workflow.get("task_type", ""),
+        workflow.get("execution_mode", ""),
+        " ".join(files),
+    ])
+    meta_tokens = set(_tfidf_tokenize(meta_blob))
+    if not meta_tokens:
+        return 0.0
+    overlap = len(query_tokens & meta_tokens)
+    return min(0.15, overlap * 0.03)
+
+
 def cmd_recall(task: str, top_k: int = 3) -> None:
     """
     讀取所有 L3 episodes（validated + candidate），
-    用 TF-IDF cosine similarity 找出最相似的 top_k 筆，
+    用 hybrid lexical + semantic similarity 找出最相似的 top_k 筆，
     輸出 JSON 陣列到 stdout。
     """
     # 讀取 validated pool（主 jsonl）
@@ -535,33 +1817,51 @@ def cmd_recall(task: str, top_k: int = 3) -> None:
         print(json.dumps([], ensure_ascii=False))
         return
 
-    # 建立語料庫（以 task 欄位為主，加上 diff_summary）
-    corpus_texts = [
-        ep.get("task", "") + " " + ep.get("diff_summary", "")
-        for ep in episodes
-    ]
+    corpus_texts = [_episode_recall_text(ep) for ep in episodes]
 
-    vectors, idf = _build_tfidf(corpus_texts)
+    lexical_vectors, lexical_idf = _build_tfidf(corpus_texts)
+    semantic_vectors, semantic_idf = _build_tfidf_with_tokenizer(corpus_texts, _semantic_tokenize)
     query_tokens = _tfidf_tokenize(task)
-    query_vec = _tfidf_query_vector(query_tokens, idf)
+    query_vec = _tfidf_query_vector(query_tokens, lexical_idf)
+    query_semantic_tokens = _semantic_tokenize(task)
+    query_semantic_vec = _tfidf_query_vector(query_semantic_tokens, semantic_idf)
+    query_token_set = set(query_tokens)
+
+    embed_texts = [task] + corpus_texts
+    embed_map, embed_ok = _get_cached_embeddings(embed_texts)
+    query_embed = embed_map.get(_text_fingerprint(task), [])
 
     # 計算相似度
     scored: list[tuple[float, int]] = []
-    for idx, vec in enumerate(vectors):
-        sim = _cosine_similarity(query_vec, vec)
-        scored.append((sim, idx))
+    for idx, ep in enumerate(episodes):
+        lexical_sim = _cosine_similarity(query_vec, lexical_vectors[idx])
+        semantic_sim = _cosine_similarity(query_semantic_vec, semantic_vectors[idx])
+        doc_embed = embed_map.get(_text_fingerprint(corpus_texts[idx]), [])
+        dense_sim = _cosine_dense(query_embed, doc_embed) if (embed_ok and query_embed and doc_embed) else 0.0
+        metadata_bonus = _metadata_overlap_score(query_token_set, ep)
+        if dense_sim > 0.0:
+            score = (dense_sim * 0.55) + (lexical_sim * 0.25) + (semantic_sim * 0.15) + metadata_bonus
+            method = "embedding_hybrid_v2"
+        else:
+            score = (lexical_sim * 0.55) + (semantic_sim * 0.35) + metadata_bonus
+            method = "hybrid_recall_v1"
+        if not ep.get("status", 1):
+            score += 0.02
+        scored.append((score, idx, method, dense_sim))
 
     scored.sort(key=lambda x: -x[0])
     top_results = scored[:top_k]
 
     output = []
-    for sim, idx in top_results:
+    for sim, idx, method, dense_sim in top_results:
         ep = episodes[idx]
         taxonomy = ep.get("taxonomy", {})
         output.append({
             "episode_id": ep.get("id", ""),
             "task": ep.get("task", ""),
             "similarity": round(sim, 4),
+            "method": method,
+            "dense_similarity": round(dense_sim, 4),
             "harness_pass": ep.get("status", 1) == 0,
             "failure_mode": taxonomy.get("failure_mode", ep.get("taxonomy", {}).get("failure_mode", "")),
             "root_cause": taxonomy.get("root_cause", ep.get("taxonomy", {}).get("root_cause", "")),
@@ -581,10 +1881,43 @@ def cmd_init():
     TRACE_ROOT.mkdir(parents=True, exist_ok=True)
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
+    json_defaults = {
+        "COMPILED_TRUTH": {
+            "version": 1,
+            "generated_at": "",
+            "summary": {},
+            "benchmark_trend": {},
+            "top_root_causes": [],
+            "top_task_types": [],
+            "rollback_reasons": [],
+            "contradictions": [],
+            "stale_truths": [],
+            "truths": [],
+        },
+        "RECALL_EMBED_CACHE": {
+            "model": OLLAMA_EMBED_MODEL,
+            "items": {},
+        },
+        "REGRESSION_GATE": {
+            "generated_at": "",
+            "history_count": 0,
+            "regressions": [],
+            "blocked": False
+        },
+        "SELF_OPT_CONFIG": {
+            "version": 1,
+            "updated_at": "",
+            "overrides": {},
+            "settings": {},
+            "last_report": {},
+        },
+        "SELF_OPT_REPORT": {},
+    }
+
     for key, path in PATHS.items():
         if not path.exists():
             if str(path).endswith(".json"):
-                save_json(path, [])
+                save_json(path, json_defaults.get(key, []))
             elif str(path).endswith(".jsonl"):
                 path.write_text("", encoding="utf-8")
             else:
@@ -857,11 +2190,29 @@ def cmd_record(
     record["training_ready"] = build_training_sample(record) is not None
 
     append_jsonl(PATHS["L3"], record)
+    append_timeline_event(
+        "episode_recorded",
+        f"{ep_id} {'PASS' if status == 0 else 'FAIL'} {failure_mode}",
+        episode_id=ep_id,
+        run_id=run_id,
+        status=status,
+        pool=pool,
+        task=task[:120],
+        files=files[:10],
+        failure_mode=failure_mode,
+        root_cause=root_cause,
+        workflow_task_type=workflow_task_type,
+        workflow_mode=workflow_mode,
+    )
     update_strategy_effectiveness(record)
     print(f"[L3] 記錄事件 {ep_id} | 分數：{score} | 優先：{priority} | 池：{pool}")
     if reasons:
         for r in reasons:
             print(f"       + {r}")
+
+    validated_count = len([ep for ep in load_jsonl(PATHS["L3"]) if ep.get("pool") == "validated"])
+    if validated_count > 0 and validated_count % 5 == 0:
+        cmd_compile_truth()
 
 
 def cmd_export_training_data(output_path: str = "", include_failed: bool = False) -> None:
@@ -1248,10 +2599,13 @@ def cmd_deep():
     # ── P3：L4 去重合併 ──────────────────────────────────
     l4_before = len([k for k in l4_all if k.get("status") == "active"])
     l4_all = _deduplicate_l4(l4_all)
+    l4_all = _normalize_l4_ids(l4_all)
     l4_after = len([k for k in l4_all if k.get("status") == "active"])
     if l4_before != l4_after:
         save_json(PATHS["L4"], l4_all)
         print(f"[Deep] 去重完成：{l4_before} → {l4_after} 條 active L4")
+    else:
+        save_json(PATHS["L4"], l4_all)
 
     qualified = [
         k for k in l4_all
@@ -1556,12 +2910,16 @@ def cmd_wake():
     now = datetime.now()
     l4_all = load_json(PATHS["L4"])
     l5_all = load_json(PATHS["L5"])
+    regression_gate = load_json(PATHS["REGRESSION_GATE"])
+    gate_blocked = bool(regression_gate.get("blocked")) if isinstance(regression_gate, dict) else False
 
     l4_inject = [
         k for k in l4_all
         if k.get("status") == "active"
         and float(k.get("confidence", 0)) >= THRESHOLDS["wake_l4_min_conf"]
     ]
+    if gate_blocked:
+        l4_inject = [k for k in l4_inject if float(k.get("confidence", 0)) >= max(0.78, THRESHOLDS["wake_l4_min_conf"])]
     l4_inject.sort(key=lambda x: x.get("confidence", 0), reverse=True)
 
     l5_inject = [
@@ -1570,6 +2928,8 @@ def cmd_wake():
         and float(s.get("confidence", 0)) >= THRESHOLDS["wake_l5_min_conf"]
         and s.get("conflict_check") != "needs_review"
     ]
+    if gate_blocked:
+        l5_inject = []
     l5_inject.sort(key=lambda x: x.get("confidence", 0), reverse=True)
 
     # 找出需要警告的項目
@@ -1580,6 +2940,8 @@ def cmd_wake():
     for s in l5_all:
         if s.get("conflict_check") == "needs_review":
             warnings.append(f"🔍 {s['id']} 策略衝突未解決，需人工確認")
+    if gate_blocked:
+        warnings.append("⛔ regression gate blocked：本輪停用 L5 注入，僅允許保守 L4 記憶")
 
     # 組合注入內容
     l4_lines = "\n".join(
@@ -1811,12 +3173,13 @@ def cmd_bridge(mempalace_output: str = ""):
     if result.get("L5_candidates"):
         print(f"[Bridge] L5 候選 {len(result['L5_candidates'])} 條（等待 --deep 升級）")
 
-    # ── P4：AutoDream — 每 10 個 validated episodes 自動觸發 --sleep ──
+    # ── P4：AutoDream — 依設定的 validated episode 門檻自動觸發 --sleep ──
     fast_mode = os.environ.get("GOVERNOR_FAST_MODE", "0") == "1"
     if not fast_mode:
         all_episodes = load_jsonl(PATHS["L3"])
         validated_count = sum(1 for e in all_episodes if e.get("pool") == "validated")
-        if validated_count > 0 and validated_count % 10 == 0:
+        interval = max(1, int(SETTINGS["bridge_auto_sleep_interval"]))
+        if validated_count > 0 and validated_count % interval == 0:
             print(f"[AutoDream] 已累積 {validated_count} episodes，自動觸發 --sleep")
             cmd_sleep()
 
@@ -1844,6 +3207,16 @@ def cmd_status():
     print(f"     wake 歷史：{len(wake_history)} 次")
     print(f"     strategy 使用紀錄：{len(strategy_history)} 件")
     print(f"     benchmark 歷史：{len(benchmark_history)} 次")
+    self_opt_history = load_jsonl(PATHS["SELF_OPT_HISTORY"])
+    print(f"     self-opt 歷史：{len(self_opt_history)} 次")
+    repo_timeline = load_jsonl(PATHS["REPO_TIMELINE"])
+    compiled_truth = load_json(PATHS["COMPILED_TRUTH"])
+    recall_cache = load_json(PATHS["RECALL_EMBED_CACHE"])
+    regression_gate = load_json(PATHS["REGRESSION_GATE"])
+    print(f"     timeline 事件：{len(repo_timeline)} 件")
+    print(f"     compiled truth：{len(compiled_truth.get('truths', [])) if isinstance(compiled_truth, dict) else 0} 條")
+    print(f"     recall embed cache：{len(recall_cache.get('items', {})) if isinstance(recall_cache, dict) else 0} 筆")
+    print(f"     regression gate：{'blocked' if isinstance(regression_gate, dict) and regression_gate.get('blocked') else 'clear'}")
 
     l4 = load_json(PATHS["L4"])
     l4_active   = [k for k in l4 if k.get("status") == "active"]
@@ -1856,10 +3229,20 @@ def cmd_status():
     if l4_active:
         avg_conf = sum(k.get("confidence", 0) for k in l4_active) / len(l4_active)
         print(f"     平均 confidence：{avg_conf:.2f}")
-        top_l4 = sorted(l4_active, key=lambda x: x.get("use_count", 0), reverse=True)[:3]
-        if any(item.get("use_count", 0) > 0 for item in top_l4):
+        top_l4 = sorted(l4_active, key=lambda x: x.get("use_count", 0), reverse=True)
+        seen_l4_ids: set[str] = set()
+        top_l4_unique: list[dict] = []
+        for item in top_l4:
+            item_id = str(item.get("id", ""))
+            if not item_id or item_id in seen_l4_ids:
+                continue
+            seen_l4_ids.add(item_id)
+            top_l4_unique.append(item)
+            if len(top_l4_unique) >= 3:
+                break
+        if any(item.get("use_count", 0) > 0 for item in top_l4_unique):
             print("     常用 L4：")
-            for item in top_l4:
+            for item in top_l4_unique:
                 if item.get("use_count", 0) > 0:
                     print(
                         f"       {item['id']} use={item.get('use_count', 0)} "
@@ -1901,6 +3284,46 @@ def cmd_status():
         for s in l5_review:
             print(f"   {s['id']} | {s['condition'][:40]}")
 
+    config = load_self_opt_config()
+    overrides = config.get("overrides", {})
+    settings = config.get("settings", {})
+    if overrides or settings:
+        print("\n[SelfOptimize] 目前生效設定")
+        for key, value in overrides.items():
+            print(f"   threshold.{key} = {value}")
+        for key, value in settings.items():
+            print(f"   setting.{key} = {value}")
+
+    if isinstance(compiled_truth, dict) and compiled_truth.get("truths"):
+        print("\n[CompiledTruth] 摘要")
+        benchmark_trend = compiled_truth.get("benchmark_trend", {})
+        summary = compiled_truth.get("summary", {})
+        print(
+            f"   recent_pass_rate={float(benchmark_trend.get('recent_pass_rate', 0.0)):.2f} "
+            f"recent_avg_iter={float(benchmark_trend.get('recent_avg_iterations', 0.0)):.2f}"
+        )
+        print(
+            f"   stale_truths={int(summary.get('stale_truths', 0))} "
+            f"contradictions={int(summary.get('contradictions', 0))}"
+        )
+        for item in compiled_truth.get("truths", [])[:3]:
+            print(
+                f"   {item.get('id')} [{item.get('category')}] "
+                f"{item.get('statement', '')[:60]}"
+            )
+
+    if isinstance(recall_cache, dict):
+        print("\n[RecallEmbed] 摘要")
+        print(
+            f"   model={recall_cache.get('model', '')} "
+            f"items={len(recall_cache.get('items', {}))} "
+            f"status={recall_cache.get('last_status', 'cold')}"
+        )
+
+    if isinstance(regression_gate, dict):
+        print("\n[RegressionGate] 摘要")
+        print(f"   blocked={1 if regression_gate.get('blocked') else 0} regressions={len(regression_gate.get('regressions', []))}")
+
     print("\n═══════════════════════════════════\n")
 
 
@@ -1926,6 +3349,15 @@ def main():
     parser.add_argument("--export-training-data", action="store_true", help="匯出 decision-SFT 訓練樣本")
     parser.add_argument("--score-strategies", action="store_true", help="依 effectiveness 調整 L4/L5 confidence")
     parser.add_argument("--recall",           action="store_true", help="TF-IDF 回憶相似過去 episodes（需 --task）")
+    parser.add_argument("--self-optimize",    action="store_true", help="分析系統狀態並產生自我優化建議")
+    parser.add_argument("--compile-truth",    action="store_true", help="編譯 L3/L4/L5/benchmark 為可用 truth")
+    parser.add_argument("--regression-gate",  action="store_true", help="檢查 benchmark 是否出現明顯回歸")
+    parser.add_argument("--warm-recall-cache", action="store_true", help="預熱 recall embedding cache")
+    parser.add_argument("--rebuild-recall-cache", action="store_true", help="重建 recall embedding cache")
+    parser.add_argument("--warm-limit", type=int, default=0, help="搭配 --warm-recall-cache，只預熱前 N 筆 episodes")
+    parser.add_argument("--apply",            action="store_true", help="搭配 --self-optimize 套用建議")
+    parser.add_argument("--diagnose",         action="store_true", help="掃描 traces，萃取 pipeline-level 問題寫入 L4")
+    parser.add_argument("--suggest",          action="store_true", help="搭配 --diagnose，用 Researcher 生成修正建議")
 
     # --record 參數
     parser.add_argument("--status-code",   type=int,   default=0,   dest="status_code")
@@ -2042,6 +3474,16 @@ def main():
         cmd_score_strategies()
     elif args.recall:
         cmd_recall(task=args.task)
+    elif args.compile_truth:
+        cmd_compile_truth()
+    elif args.regression_gate:
+        cmd_regression_gate()
+    elif args.warm_recall_cache:
+        cmd_warm_recall_cache(force=args.rebuild_recall_cache, limit=args.warm_limit)
+    elif args.self_optimize:
+        cmd_self_optimize(apply=args.apply)
+    elif args.diagnose:
+        cmd_diagnose(suggest=args.suggest)
     else:
         parser.print_help()
 

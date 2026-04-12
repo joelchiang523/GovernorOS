@@ -2,8 +2,8 @@
 # startup.sh — AI System v3.0 時間排程腳本
 #
 # 用法：
-#   ./startup.sh morning   → 09:00 啟動（decay + score-strategies + wake）
-#   ./startup.sh evening   → 15:00-16:00 盤後整合（sleep + deep + decay）
+#   ./startup.sh morning   → 09:00 啟動（decay + score-strategies + self-opt + compile-truth + warm-recall + wake）
+#   ./startup.sh evening   → 15:00-16:00 盤後整合（sleep + deep + decay + analyze + self-opt + compile-truth + regression-gate）
 #   ./startup.sh status    → 顯示記憶系統狀態
 #   ./startup.sh init      → 第一次使用：初始化所有記憶檔案
 #   ./startup.sh analyze   → 分析 Git Diff Intel patterns
@@ -69,7 +69,7 @@ except Exception:
 
     if [ "$SHOULD_SLEEP" = "1" ]; then
         echo ""
-        echo "[0/4] 距上次 --sleep 已超過 24 小時，自動執行 DreamCycle --sleep..."
+        echo "[0/7] 距上次 --sleep 已超過 24 小時，自動執行 DreamCycle --sleep..."
         $DC --sleep
         $PYTHON -c "
 import json, sys
@@ -84,19 +84,31 @@ p.write_text(json.dumps(data, ensure_ascii=False, indent=2))
     fi
 
     echo ""
-    echo "[1/4] Memory Decay Check..."
+    echo "[1/7] Memory Decay Check..."
     $DC --decay
 
     echo ""
-    echo "[2/4] Strategy Effectiveness Scoring..."
+    echo "[2/7] Strategy Effectiveness Scoring..."
     $DC --score-strategies
 
     echo ""
-    echo "[3/4] Conflict Check（含 decay wake）..."
+    echo "[3/7] Self-Optimize（門檻/節奏保守調整）..."
+    $DC --self-optimize --apply
+
+    echo ""
+    echo "[4/7] Compile Truth（事實層與近期趨勢）..."
+    $DC --compile-truth
+
+    echo ""
+    echo "[5/7] Warm Recall Cache（若 embeddings 可用則預熱）..."
+    $DC --warm-recall-cache || true
+
+    echo ""
+    echo "[6/7] Conflict Check（含 decay wake）..."
     $DC --wake
 
     echo ""
-    echo "[4/4] 系統狀態..."
+    echo "[7/7] 系統狀態..."
     $DC --status
 
     echo ""
@@ -111,7 +123,7 @@ cmd_evening() {
     echo_header "Evening Integration"
 
     echo ""
-    echo "[1/4] DreamCycle --sleep（L3 → L4）..."
+    echo "[1/7] DreamCycle --sleep（L3 → L4）..."
     $DC --sleep
     # 記錄 last_sleep 時間
     LAST_DREAM_FILE="$SCRIPT_DIR/memory/last_dream.json"
@@ -127,16 +139,28 @@ p.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 " 2>/dev/null || true
 
     echo ""
-    echo "[2/4] DreamCycle --deep（L4 → L5）..."
+    echo "[2/7] DreamCycle --deep（L4 → L5）..."
     $DC --deep
 
     echo ""
-    echo "[3/4] Memory Decay Check..."
+    echo "[3/7] Memory Decay Check..."
     $DC --decay
 
     echo ""
-    echo "[4/4] Git Diff Intel Pattern 分析..."
+    echo "[4/7] Git Diff Intel Pattern 分析..."
     $DI --analyze
+
+    echo ""
+    echo "[5/7] Self-Optimize（依最新 benchmark / strategy 調整）..."
+    $DC --self-optimize --apply
+
+    echo ""
+    echo "[6/7] Compile Truth（整合新 episodes / benchmark）..."
+    $DC --compile-truth
+
+    echo ""
+    echo "[7/7] Regression Gate（檢查 benchmark 回歸）..."
+    $DC --regression-gate
 
     echo ""
     echo "[狀態摘要]"
@@ -211,8 +235,8 @@ case "$CMD" in
         echo "用法：./startup.sh [morning|evening|init|status|analyze]"
         echo ""
         echo "  init     → 第一次使用，初始化記憶目錄"
-        echo "  morning  → 09:00 啟動（decay + score-strategies + wake 注入）"
-        echo "  evening  → 15:00 盤後整合（sleep + deep + decay）"
+        echo "  morning  → 09:00 啟動（decay + score-strategies + self-opt + compile-truth + warm-recall + wake）"
+        echo "  evening  → 15:00 盤後整合（sleep + deep + decay + analyze + self-opt + compile-truth + regression-gate）"
         echo "  status   → 顯示 L3/L4/L5 + DiffIntel 狀態"
         echo "  analyze  → 手動分析 Git Diff 模式"
         echo ""
