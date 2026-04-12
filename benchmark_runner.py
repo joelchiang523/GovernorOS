@@ -17,7 +17,7 @@ Suite JSON 格式：
       "aider_files": ["src/auth.py", "tests/test_auth.py"],
       "max_iter": 6,
       "score_pattern": "",
-      "aider_model": "claude-3-5-sonnet-20241022"
+      "aider_model": "ollama/qwen3.5:9b"
     }
   ]
 }
@@ -25,6 +25,8 @@ Suite JSON 格式：
 
 import argparse
 import json
+import os
+import re
 import subprocess
 import sys
 import time
@@ -36,11 +38,36 @@ BASE_DIR = Path(__file__).parent
 MAIN_LOOP = BASE_DIR / "main_loop.py"
 DEFAULT_OUTPUT_DIR = BASE_DIR / "benchmark_reports"
 BENCHMARK_HISTORY_PATH = BASE_DIR / "memory" / "benchmark_history.jsonl"
+DEFAULT_AIDER_MODEL = os.environ.get("OLLAMA_MODEL_AIDER", "ollama/qwen3.5:9b")
 
 
 def load_suite(path: Path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def complexity_score(case: dict) -> tuple[str, int]:
+    """
+    Analyse task complexity by counting function patterns like (1), (2), (3).
+    Returns (complexity_label, timeout_sec).
+    Override with case.get("timeout_sec") if explicitly set.
+    """
+    task = case.get("task", "")
+    matches = re.findall(r'\(\d+\)', task)
+    count = len(matches)
+    if count <= 1:
+        complexity = "low"
+        timeout = 900
+    elif count == 2:
+        complexity = "medium"
+        timeout = 1200
+    else:
+        complexity = "high"
+        timeout = 1800
+    # Explicit override
+    if case.get("timeout_sec") is not None:
+        timeout = int(case["timeout_sec"])
+    return complexity, timeout
 
 
 def tail_text(text: str, limit: int = 1200) -> str:
@@ -75,7 +102,7 @@ def run_case(case: dict, dry_run: bool = False) -> dict:
         "--harness", case["harness"],
         "--work-dir", case["work_dir"],
         "--max-iter", str(case.get("max_iter", 8)),
-        "--aider-model", case.get("aider_model", "claude-3-5-sonnet-20241022"),
+        "--aider-model", case.get("aider_model", DEFAULT_AIDER_MODEL),
     ]
 
     aider_files = case.get("aider_files", [])
@@ -86,12 +113,41 @@ def run_case(case: dict, dry_run: bool = False) -> dict:
     if dry_run:
         cmd.append("--dry-run")
 
-    result = subprocess.run(
-        cmd,
-        cwd=BASE_DIR,
-        capture_output=True,
-        text=True,
-    )
+    complexity, task_timeout = complexity_score(case)
+    # GOVERNOR_FAST_MODE=1 跳過 MemPalace/Bridge Ollama 呼叫，大幅加速 benchmark 評估
+    bench_env = {**os.environ, "GOVERNOR_FAST_MODE": "1"}
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=BASE_DIR,
+            capture_output=True,
+            text=True,
+            timeout=task_timeout,
+            env=bench_env,
+        )
+    except subprocess.TimeoutExpired as e:
+        duration = round(time.time() - begin, 2)
+        stdout_tail = tail_text((e.stdout or b"").decode("utf-8", errors="replace"))
+        stderr_tail = tail_text((e.stderr or b"").decode("utf-8", errors="replace"))
+        return {
+            "id": case["id"],
+            "task": case["task"],
+            "started_at": started_at,
+            "duration_sec": duration,
+            "passed": False,
+            "exit_code": -1,
+            "work_dir": case["work_dir"],
+            "harness": case["harness"],
+            "aider_files": case.get("aider_files", []),
+            "iterations": 0,
+            "rollback_count": 0,
+            "task_complete": False,
+            "final_state": "timeout",
+            "trace_dir": "",
+            "run_id": "",
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+        }
     duration = round(time.time() - begin, 2)
     passed = result.returncode == 0
     loop_result = parse_loop_result(result.stdout)
@@ -194,10 +250,20 @@ def main() -> int:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    cases = []
-    for case in suite.get("cases", []):
+    # Validate all cases first
+    raw_cases = suite.get("cases", [])
+    for case in raw_cases:
         if not case.get("id") or not case.get("task") or not case.get("harness") or not case.get("work_dir"):
             raise ValueError(f"benchmark case 缺少必要欄位：{case}")
+
+    # Sort by complexity: low → medium → high (stable sort preserves original order within same level)
+    complexity_order = {"low": 0, "medium": 1, "high": 2}
+    sorted_cases = sorted(raw_cases, key=lambda c: complexity_order[complexity_score(c)[0]])
+
+    cases = []
+    for case in sorted_cases:
+        comp, timeout = complexity_score(case)
+        print(f"[Benchmark] {case['id']} complexity={comp} timeout={timeout}s")
         result = run_case(case, dry_run=args.dry_run)
         cases.append(result)
         print(

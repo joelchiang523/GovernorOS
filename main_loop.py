@@ -7,7 +7,7 @@ Usage:
   python main_loop.py \\
     --task    "實作 RSI 超買超賣過濾器" \\
     --harness "pytest tests/ -q" \\
-    [--aider-model claude-3-5-sonnet] \\
+    [--aider-model ollama/qwen2.5-coder:14b] \\
     [--aider-files src/signals.py src/core.py] \\
     [--work-dir /path/to/project] \\
     [--max-iter 20] \\
@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -36,14 +37,37 @@ from typing import Optional
 
 import requests
 
-# ── aider 執行檔路徑（優先 PATH，其次 conda 環境）────────────
+# ── aider 執行檔路徑（保留作 fallback，主要流程已不依賴）──────
 AIDER_BIN: str = (
     shutil.which("aider")
     or os.path.expanduser("~/.local/bin/aider")
 )
 
-# ── Aider subprocess 超時（本地大模型生成較慢）────────────────
-AIDER_TIMEOUT: int = int(os.environ.get("AIDER_TIMEOUT", "900"))   # 預設 15 分鐘
+# ── Harness Python 路徑（確保有 pytest，優先使用啟動本腳本的 Python）──
+def _detect_python_exec() -> str:
+    """找到帶有 pytest 的 python3 執行檔。
+    優先使用 sys.executable（conda 環境），再嘗試 PATH 中的 python3。
+    """
+    candidates = [sys.executable]
+    which_py = shutil.which("python3")
+    if which_py and which_py != sys.executable:
+        candidates.append(which_py)
+    for py in candidates:
+        try:
+            r = subprocess.run(
+                [py, "-c", "import pytest"],
+                capture_output=True, timeout=5,
+            )
+            if r.returncode == 0:
+                return py
+        except Exception:
+            continue
+    return sys.executable  # 最終 fallback
+
+HARNESS_PYTHON: str = _detect_python_exec()
+
+# ── Aider subprocess 超時（保留設定，DDI 超時另行管理）────────
+AIDER_TIMEOUT: int = int(os.environ.get("AIDER_TIMEOUT", "1200"))   # 預設 20 分鐘
 
 BASE_DIR    = Path(__file__).parent
 MEMORY_DIR  = BASE_DIR / "memory"
@@ -55,6 +79,7 @@ L3_JSONL    = MEMORY_DIR / "L3_episodes.jsonl"
 L4_JSON     = MEMORY_DIR / "L4_knowledge.json"
 L5_JSON     = MEMORY_DIR / "L5_strategies.json"
 TRACE_DIR   = MEMORY_DIR / "traces"
+FAST_MODE   = os.environ.get("GOVERNOR_FAST_MODE", "0") == "1"
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
@@ -69,9 +94,62 @@ OLLAMA_MODEL_RESEARCHER = os.environ.get(
     "qwen3.5:9b",   # 同家族 Governor（qwen3.5:27b），JSON 遵從性強，6.6GB 不與 Governor 搶 VRAM
 )
 OLLAMA_MODEL = OLLAMA_MODEL_GOVERNOR  # 向後相容
+AIDER_MODEL_LOCAL = os.environ.get(
+    "OLLAMA_MODEL_AIDER",
+    "ollama/qwen3.5:27b",
+)
 
 WAKE_L4_MIN_CONF = 0.70
 WAKE_L5_MIN_CONF = 0.75
+
+
+# ─────────────────────────────────────────────
+# Ollama 呼叫工具（DDI Pipeline 共用）
+# ─────────────────────────────────────────────
+
+def ollama_call(prompt: str, model: str = "", timeout: int = 300, keep_alive: Optional[str] = None) -> str:
+    """呼叫本地 Ollama API，回傳模型回應字串。
+    keep_alive="0" 表示呼叫完成後立即卸載模型（節省 VRAM，避免佔用影響下次呼叫）。
+    """
+    _model = model or OLLAMA_MODEL_RESEARCHER
+    payload: dict = {"model": _model, "prompt": prompt, "stream": False}
+    if keep_alive is not None:
+        payload["keep_alive"] = keep_alive
+    try:
+        resp = requests.post(
+            OLLAMA_URL,
+            json=payload,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        return resp.json().get("response", "").strip()
+    except requests.exceptions.ConnectionError:
+        print(f"[ERROR] 無法連接 Ollama（{OLLAMA_URL}），請確認 ollama serve 已啟動")
+        return ""
+    except requests.exceptions.Timeout:
+        print(f"[ERROR] Ollama 呼叫逾時（{timeout}s），模型={_model}")
+        return ""
+    except Exception as e:
+        print(f"[ERROR] Ollama 呼叫失敗：{e}")
+        return ""
+
+
+def parse_json_from_response(text: str) -> Optional[dict | list]:
+    """從模型回應中提取 JSON（支援 ```json ... ``` 或裸 JSON）。"""
+    text = re.sub(r"```json\s*", "", text)
+    text = re.sub(r"```\s*", "", text)
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+    print(f"[WARN] 無法解析 JSON，原始回應片段：{text[:200]}")
+    return None
 
 
 # ─────────────────────────────────────────────
@@ -384,6 +462,54 @@ def summarize_file_plan(file_plan: list[dict], limit: int = 5) -> str:
     return "; ".join(parts)
 
 
+def build_task_batches(
+    aider_files: list[str],
+    file_plan: list[dict],
+    complexity: str,
+) -> list[dict]:
+    if not aider_files:
+        return [{"label": "full_scope", "files": []}]
+
+    ordered_files = [item["file"] for item in file_plan if item.get("file")] or list(aider_files)
+    ordered_files = list(dict.fromkeys(ordered_files))
+    if len(ordered_files) <= 3:
+        return [{"label": "full_scope", "files": ordered_files}]
+
+    batch_size = 2 if complexity == "high" or len(ordered_files) >= 8 else 3
+    batches = []
+    for idx in range(0, len(ordered_files), batch_size):
+        chunk = ordered_files[idx: idx + batch_size]
+        batches.append({
+            "label": f"batch_{len(batches) + 1}",
+            "files": chunk,
+        })
+    return batches
+
+
+def select_iteration_files(
+    iteration: int,
+    task_batches: list[dict],
+    fallback_files: list[str],
+) -> tuple[list[str], str]:
+    if not task_batches:
+        return fallback_files, "full_scope"
+    if len(task_batches) == 1:
+        return task_batches[0]["files"], task_batches[0]["label"]
+
+    batch_count = len(task_batches)
+    if iteration <= batch_count:
+        batch = task_batches[iteration - 1]
+        return batch["files"], batch["label"]
+
+    integration_step = iteration - batch_count
+    merge_count = min(batch_count, 1 + integration_step)
+    merged = []
+    for batch in task_batches[:merge_count]:
+        merged.extend(batch["files"])
+    merged = list(dict.fromkeys(merged))
+    return merged or fallback_files, f"integration_{merge_count}"
+
+
 def build_workflow_plan(
     task: str,
     harness_cmd: str,
@@ -394,6 +520,8 @@ def build_workflow_plan(
     last_harness_output: str,
     selected_l4: list[dict],
     selected_l5: list[dict],
+    active_files: list[str],
+    active_label: str,
 ) -> dict:
     task_type = infer_task_type(task, harness_cmd, aider_files)
     complexity = infer_task_complexity(task, aider_files, max_iter)
@@ -435,6 +563,8 @@ def build_workflow_plan(
         "rollback_risk": rollback_risk,
         "file_plan": file_plan,
         "parsed_task": parsed_task,
+        "active_files": active_files,
+        "active_label": active_label,
         "strategy_note": " | ".join(strategy_parts)[:600],
     }
 
@@ -486,6 +616,15 @@ def run_harness(
     pass      = exit_code == 0
     score     = 從 output 中用 score_pattern 提取；無則回 0.0
     """
+    # 確保 harness 使用有 pytest 的 Python（替換 python3/python 為 HARNESS_PYTHON）
+    _hp = shlex.quote(HARNESS_PYTHON)
+    _cmd_patched = re.sub(r'\bpython3\b', _hp, cmd, count=1)
+    if _cmd_patched == cmd:
+        _cmd_patched = re.sub(r'\bpython\b', _hp, cmd, count=1)
+    if _cmd_patched != cmd:
+        print(f"[Harness] python → {HARNESS_PYTHON}")
+    cmd = _cmd_patched
+
     result = subprocess.run(
         cmd, shell=True, cwd=work_dir,
         capture_output=True, text=True, timeout=300,
@@ -516,6 +655,641 @@ def run_harness(
 # Aider 執行
 # ─────────────────────────────────────────────
 
+def extract_local_editor_content(output: str, target_file: str) -> Optional[str]:
+    tagged_patterns = [
+        rf"<<FILE:{re.escape(target_file)}>>\s*\n?(.*?)\n?<<END_FILE>>",
+        r"<<FILE>>\s*\n?(.*?)\n?<<END_FILE>>",
+    ]
+    for pattern in tagged_patterns:
+        matches = re.findall(pattern, output, re.DOTALL)
+        if matches:
+            content = matches[-1]
+            return content.lstrip("\n")
+
+    fenced = re.findall(r"```(?:[\w.+-]+)?\n(.*?)```", output, re.DOTALL)
+    if fenced:
+        return fenced[-1].lstrip("\n")
+
+    return None
+
+
+def coerce_subprocess_output(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def run_local_qwen_editor(
+    task_with_context: str,
+    files: list[str],
+    work_dir: Path,
+    model: str,
+) -> tuple[str, bool]:
+    if len(files) != 1:
+        return "[LocalQwenEditor] 單檔模式限定 1 個檔案", False
+
+    target_file = files[0]
+    target_path = work_dir / target_file
+    if not target_path.exists():
+        return f"[LocalQwenEditor] 找不到檔案：{target_file}", False
+
+    try:
+        original = target_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        original = target_path.read_text(encoding="utf-8", errors="replace")
+
+    normalized_model = model.replace("ollama/", "", 1)
+    prompt = (
+        f"Edit this one file only: {target_file}\n"
+        "Return the full updated file only.\n"
+        f"Format:\n<<FILE:{target_file}>>\n...\n<<END_FILE>>\n"
+        "No explanation.\n\n"
+        f"[TASK]\n{task_with_context}\n\n"
+        f"[FILE]\n{original}"
+    )
+
+    print(f"[LocalQwenEditor] 直接呼叫 Ollama API {normalized_model} 編輯 {target_file}")
+    local_timeout = int(os.environ.get("LOCAL_QWEN_EDIT_TIMEOUT", "240"))
+    try:
+        resp = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": normalized_model,
+                "prompt": prompt,
+                "stream": False,
+            },
+            timeout=min(AIDER_TIMEOUT, local_timeout),
+        )
+        resp.raise_for_status()
+        output = resp.json().get("response", "")
+        returncode = 0
+    except requests.Timeout:
+        print(f"[LocalQwenEditor] timeout={local_timeout}s，改從部分輸出擷取")
+        output = ""
+        returncode = 0
+    except Exception as exc:
+        output = coerce_subprocess_output(exc)
+        returncode = 1
+
+    extracted = extract_local_editor_content(output, target_file)
+
+    if returncode != 0:
+        print(f"[LocalQwenEditor] 執行異常（exit={returncode}）")
+        lines = output.strip().splitlines()
+        if lines:
+            print("\n".join(lines[-10:]))
+        return output, False
+
+    if not extracted:
+        print("[LocalQwenEditor] 無法從模型輸出擷取完整檔案內容")
+        return output, False
+
+    if extracted != original:
+        target_path.write_text(extracted, encoding="utf-8")
+        print(f"[LocalQwenEditor] 已寫入 {target_file}")
+    else:
+        print(f"[LocalQwenEditor] {target_file} 無差異")
+
+    task_complete = bool(re.search(r'^\s*TASK_COMPLETE\s*$', output, re.MULTILINE))
+    return output, task_complete
+
+
+# ─────────────────────────────────────────────
+# DDI Pipeline（Decompose → Draft → Integrate → Self-validate）
+# 讓本地 qwen3.5 獨立分解複雜任務、逐段生成程式碼、整合後自我驗證
+# ─────────────────────────────────────────────
+
+def _find_test_file_content(work_dir: Path, target_file: str) -> str:
+    """嘗試找到對應測試檔案並讀取（供 DDI 推斷函數簽名）"""
+    stem = Path(target_file).stem
+    candidates = [
+        work_dir / "tests" / f"test_{stem}.py",
+        work_dir / f"test_{stem}.py",
+        work_dir / "tests" / f"{stem}_test.py",
+        work_dir / f"{stem}_test.py",
+    ]
+    for c in candidates:
+        if c.exists():
+            try:
+                return c.read_text(encoding="utf-8")[:1500]
+            except Exception:
+                pass
+    return ""
+
+
+def _extract_function_code(raw: str, function_name: str) -> str:
+    """從模型輸出中提取指定函數的完整程式碼"""
+    # 嘗試 markdown code block
+    code_blocks = re.findall(r'```(?:python)?\n(.*?)```', raw, re.DOTALL)
+    for block in reversed(code_blocks):
+        if f"def {function_name}" in block:
+            lines = block.splitlines()
+            func_lines: list[str] = []
+            in_func = False
+            base_indent = 0
+            for line in lines:
+                stripped = line.lstrip()
+                if not in_func:
+                    if stripped.startswith(f"def {function_name}"):
+                        in_func = True
+                        base_indent = len(line) - len(stripped)
+                        func_lines.append(line)
+                else:
+                    cur_indent = len(line) - len(line.lstrip()) if line.strip() else base_indent + 4
+                    if line.strip() and cur_indent <= base_indent and stripped.startswith(("def ", "class ", "@")):
+                        break
+                    func_lines.append(line)
+            while func_lines and not func_lines[-1].strip():
+                func_lines.pop()
+            if func_lines:
+                return "\n".join(func_lines)
+        elif block.strip().startswith("def "):
+            return block.strip()
+
+    # 直接在原始文本掃描
+    lines = raw.splitlines()
+    func_lines = []
+    in_func = False
+    base_indent = 0
+    for line in lines:
+        stripped = line.lstrip()
+        if not in_func:
+            if stripped.startswith(f"def {function_name}"):
+                in_func = True
+                base_indent = len(line) - len(stripped)
+                func_lines.append(line)
+        else:
+            cur_indent = len(line) - len(line.lstrip()) if line.strip() else base_indent + 4
+            if line.strip() and cur_indent <= base_indent and stripped.startswith(("def ", "class ", "@")):
+                break
+            func_lines.append(line)
+    while func_lines and not func_lines[-1].strip():
+        func_lines.pop()
+    return "\n".join(func_lines) if func_lines else ""
+
+
+def should_use_ddi(task: str, file_content: str, files: list[str]) -> bool:
+    """
+    判斷任務是否需要 DDI 分解。
+    有多個函數目標、多個檔案、或現有多函數修正任務才需分解。
+    """
+    # 多個編號項目（1. 2. 3. 或 (1)(2)(3)）
+    if re.search(r'(?:^|\n|\s)[（(]?[1-9][.、:）)]\s+\S', task):
+        return True
+    # 多個檔案
+    if len(files) >= 2:
+        return True
+    # 明確提到多個函數（實作/修正 xxx() + 實作/修正 yyy()）
+    func_keywords = re.findall(
+        r'(?:實作|修正|修改|implement|fix)\s+\w+\s*\(',
+        task, re.IGNORECASE,
+    )
+    if len(func_keywords) >= 2:
+        return True
+    # 現有檔案有 3+ 函數定義且任務是修正類
+    defs = len(re.findall(r'^def\s+', file_content, re.MULTILINE))
+    if defs >= 3 and any(kw in task for kw in ["修正", "修改", "fix", "修復"]):
+        return True
+    return False
+
+
+def ddi_decompose(
+    task: str,
+    file_content: str,
+    filename: str,
+    test_content: str,
+) -> list[dict]:
+    """
+    Stage 1（Researcher）：將任務分解為原子子任務 JSON 陣列。
+    每個子任務只對應一個函數/方法，合計必須覆蓋整個任務需求。
+    驗證：解析後確認所有任務要求的函數都有對應子任務。
+    """
+    existing_funcs = re.findall(r'^def\s+(\w+)', file_content, re.MULTILINE)
+    func_list = ", ".join(existing_funcs[:12]) if existing_funcs else "（無）"
+
+    prompt = f"""你是任務分解專家。仔細閱讀任務需求，列出所有需要新增或修正的函數，分解為原子子任務。
+
+任務需求：{task}
+
+目標檔案：{filename}
+現有函數清單：{func_list}
+
+測試案例（用於確認函數簽名，部分）：
+{test_content[:900] if test_content else "（不可用）"}
+
+輸出嚴格 JSON 陣列（確保覆蓋任務所有要求的函數）：
+[
+  {{
+    "id": "sub_1",
+    "function_name": "要新增或修正的函數名稱",
+    "goal": "此函數的具體實作目標（50字以內）",
+    "signature": "def function_name(param1, param2):",
+    "dependencies": [],
+    "acceptance": "驗收標準（20字以內）",
+    "is_fix": false
+  }}
+]
+
+規則：
+- id 依序 sub_1, sub_2...
+- is_fix=true 表示修正現有函數，false 表示新增
+- dependencies 只填同陣列的其他 id
+- 只輸出 JSON 陣列，禁止任何說明文字
+"""
+
+    raw = ollama_call(prompt, model=OLLAMA_MODEL_RESEARCHER, timeout=300)
+    parsed = parse_json_from_response(raw)
+    if not parsed or not isinstance(parsed, list):
+        print("[DDI-Decompose] 無法解析子任務，降級為單次生成")
+        return []
+
+    valid: list[dict] = []
+    for item in parsed:
+        fn = str(item.get("function_name", "")).strip()
+        goal = str(item.get("goal", "")).strip()
+        if fn and goal:
+            valid.append({
+                "id": item.get("id", f"sub_{len(valid)+1}"),
+                "function_name": fn,
+                "goal": goal[:160],
+                "signature": str(item.get("signature", f"def {fn}(...):")),
+                "dependencies": [str(d) for d in item.get("dependencies", [])],
+                "acceptance": str(item.get("acceptance", "通過 harness 測試"))[:80],
+                "is_fix": bool(item.get("is_fix", False)),
+            })
+
+    # ── 補全驗證：確保 test 檔中所有被呼叫的函數都有對應子任務 ──────────
+    if test_content:
+        # 從 test 檔抓出被 import 的函數名稱（from solution import f1, f2, ...）
+        import_match = re.search(r'from\s+\w+\s+import\s+(.+)', test_content)
+        if import_match:
+            imported = [f.strip() for f in import_match.group(1).split(',')]
+            covered = {s['function_name'] for s in valid}
+            for fn in imported:
+                if fn and fn not in covered:
+                    # 從現有函數清單判斷是修正還是新增
+                    is_fix = fn in existing_funcs
+                    valid.append({
+                        "id": f"sub_{len(valid)+1}",
+                        "function_name": fn,
+                        "goal": f"實作或修正 {fn}（由 test 補全）",
+                        "signature": f"def {fn}(...):",
+                        "dependencies": [],
+                        "acceptance": "通過 harness 測試",
+                        "is_fix": is_fix,
+                    })
+                    print(f"[DDI-Decompose] 補全缺漏子任務：{fn}")
+
+    print(f"[DDI-Decompose] {len(valid)} 個子任務：{', '.join(s['function_name'] for s in valid)}")
+    return valid
+
+
+def ddi_draft_subtask(
+    subtask: dict,
+    file_content: str,
+    completed_drafts: dict[str, str],
+    extra_hint: str = "",
+) -> str:
+    """
+    Stage 2（Researcher）：對單一子任務生成函數程式碼。
+    每次只聚焦一個函數，context 精簡，減少模型混亂。
+    """
+    # 已完成函數的第一行（簽名），用於介面一致性
+    completed_sigs = "\n".join(
+        code.splitlines()[0]
+        for code in completed_drafts.values()
+        if code.strip()
+    )[:400]
+
+    hint_line = f"\n注意修正方向：{extra_hint}" if extra_hint else ""
+
+    prompt = f"""只實作以下單一函數，不要輸出其他函數、import 語句或任何說明。
+
+函數名稱：{subtask['function_name']}
+實作目標：{subtask['goal']}
+函數簽名：{subtask['signature']}
+驗收標準：{subtask['acceptance']}{hint_line}
+
+現有程式碼片段（介面參考，勿重複輸出）：
+{file_content[:900]}
+
+已完成其他函數簽名（介面一致性）：
+{completed_sigs if completed_sigs else "（無）"}
+
+輸出：直接以 def {subtask['function_name']}( 開頭的完整函數定義，無任何前後說明。
+"""
+
+    raw = ollama_call(prompt, model=OLLAMA_MODEL_RESEARCHER, timeout=300)
+
+    # 精確提取目標函數
+    code = _extract_function_code(raw, subtask["function_name"])
+    if not code:
+        # fallback：取最後一個 code block
+        blocks = re.findall(r'```(?:python)?\n(.*?)```', raw, re.DOTALL)
+        code = blocks[-1].strip() if blocks else raw.strip()
+
+    print(f"[DDI-Draft] {subtask['function_name']}: {len(code.splitlines())} 行")
+    return code
+
+
+def ddi_integrate(
+    task: str,
+    file_content: str,
+    filename: str,
+    subtasks: list[dict],
+    drafts: dict[str, str],
+) -> str:
+    """
+    Stage 3（Governor）：將所有子任務草稿整合為完整、可執行的目標檔案。
+    處理 import、函數順序、命名衝突，保留原始非任務相關程式碼。
+    """
+    drafts_text = "\n\n".join(
+        f"### [{s['id']}] {s['function_name']} ###\n{drafts.get(s['id'], '(未生成，保留原有實作)')}"
+        for s in subtasks
+    )
+
+    prompt = f"""你是程式整合專家。將各函數草稿整合成完整、可直接執行的 Python 檔案。
+
+任務：{task}
+目標檔案：{filename}
+
+原始檔案（保留非任務相關程式碼）：
+{file_content[:1800]}
+
+各函數草稿（全部需整合進最終檔案）：
+{drafts_text[:3500]}
+
+整合規則：
+1. 輸出完整的 {filename} 內容（從第一行到最後一行）
+2. 所有必要 import 放置於檔案開頭
+3. 保留原始非任務相關的 class、常數、helper 函數
+4. 將各草稿函數整合（修正縮排、命名衝突）
+5. 依賴關係排序：被呼叫的函數定義在前
+6. 同名函數用草稿版本取代原有版本
+7. 只輸出純 Python 程式碼，禁止輸出說明或 markdown fence（```）
+"""
+
+    # keep_alive="0"：整合完成後立即卸載 Governor，讓 Researcher(9b) 不必等 5 分鐘 VRAM 釋放
+    raw = ollama_call(prompt, model=OLLAMA_MODEL_GOVERNOR, timeout=300, keep_alive="0")
+
+    # 去除 markdown fence
+    blocks = re.findall(r'```(?:python)?\n(.*?)```', raw, re.DOTALL)
+    integrated = blocks[-1].strip() if blocks else raw.strip()
+
+    if not integrated:
+        print("[DDI-Integrate] 整合輸出為空")
+        return ""
+
+    print(f"[DDI-Integrate] 完成：{len(integrated.splitlines())} 行")
+    return integrated
+
+
+def ddi_self_validate(
+    task: str,
+    integrated_code: str,
+    subtasks: list[dict],
+    test_content: str,
+) -> dict:
+    """
+    Stage 4（Researcher）：harness 執行前的自我驗證。
+    確認整合後程式碼覆蓋所有需求、無明顯錯誤，
+    回傳失敗子任務 id 供針對性重試。
+    """
+    subtask_list = "\n".join(
+        f"- {s['function_name']}: {s['goal']} → 驗收: {s['acceptance']}"
+        for s in subtasks
+    )
+
+    prompt = f"""你是程式碼審核員。逐一確認整合後程式碼是否符合所有任務需求。
+
+原始任務：{task}
+
+需要實作的函數清單：
+{subtask_list}
+
+整合後程式碼：
+{integrated_code[:2500]}
+
+測試案例提示（函數簽名參考）：
+{test_content[:600] if test_content else "（不可用）"}
+
+審核項目（逐一確認）：
+1. 每個函數是否存在於程式碼中（搜尋 "def function_name"）
+2. 函數簽名是否與需求匹配
+3. 是否有明顯邏輯錯誤（空函數體只有 pass、缺少 return、無限迴圈）
+4. import 是否完整
+
+只輸出 JSON（禁止任何說明）：
+{{
+  "pass": true,
+  "confidence": 0.90,
+  "issues": ["具體問題描述（無問題時為空陣列）"],
+  "failing_subtasks": ["需要重試的子任務 id（無問題時為空陣列）"],
+  "summary": "一句話審核摘要"
+}}
+"""
+
+    raw = ollama_call(prompt, model=OLLAMA_MODEL_RESEARCHER, timeout=300)
+    result = parse_json_from_response(raw)
+
+    if not result or not isinstance(result, dict):
+        print("[DDI-Validate] 回應解析失敗，假設通過")
+        return {"pass": True, "confidence": 0.5, "issues": [], "failing_subtasks": [], "summary": "解析失敗"}
+
+    passed = bool(result.get("pass", True))
+    conf = float(result.get("confidence", 0.5))
+    issues = result.get("issues", [])
+    status_str = "PASS" if passed else f"FAIL（{len(issues)} 個問題）"
+    print(f"[DDI-Validate] {status_str}  confidence={conf:.2f}")
+    for issue in issues[:4]:
+        print(f"  問題: {issue}")
+    return result
+
+
+def _single_shot_generate(task: str, file_content: str, filename: str, model: str) -> str:
+    """
+    Fallback：單次呼叫生成整個檔案。
+    適用於簡單單函數任務，或 DDI 分解/整合失敗時的保底機制。
+    """
+    prompt = (
+        f"修正或實作以下程式任務，輸出完整的 {filename} 檔案。\n"
+        f"任務：{task}\n\n"
+        f"當前檔案內容：\n{file_content[:2000]}\n\n"
+        "輸出規則：\n"
+        "1. 直接輸出完整 Python 程式碼\n"
+        "2. 不要輸出說明、注釋或任何非程式碼文字\n"
+        "3. 不要輸出 markdown fence（```）\n"
+        "4. 從第一個 import 或 def 或 class 開始"
+    )
+    raw = ollama_call(prompt, model=model, timeout=300)
+    blocks = re.findall(r'```(?:python)?\n(.*?)```', raw, re.DOTALL)
+    return blocks[-1].strip() if blocks else raw.strip()
+
+
+def run_local_ollama_ddi(
+    task_with_context: str,
+    files: list[str],
+    work_dir: Path,
+    model: str,
+) -> tuple[str, bool]:
+    """
+    DDI Pipeline 主函式：Decompose → Draft → Integrate → Self-validate
+    ─────────────────────────────────────────────────────────────────
+    • Stage 1  Researcher 分解任務為原子子任務（每子任務 = 一個函數）
+    • Stage 2  Researcher 逐子任務生成程式碼（小 context、精準輸出）
+    • Stage 3  Governor 將所有草稿整合為完整檔案
+    • Stage 4  Researcher 自我驗證是否符合需求，不過則針對性重試
+
+    取代外部 aider binary，支援所有本地 ollama 模型與多檔案任務。
+    task_complete 永遠回傳 False，由後續 harness 結果決定成敗。
+    """
+    normalized_model = model.replace("ollama/", "", 1)
+    output_log: list[str] = []
+    any_changed = False
+
+    # 從帶有 context 的完整訊息中提取核心任務描述
+    core_task = task_with_context
+    m = re.search(r'任務[：:]\s*(.+?)(?:\n|驗收|本輪|$)', task_with_context, re.DOTALL)
+    if m:
+        core_task = m.group(1).strip()[:500]
+    if not core_task or len(core_task) < 10:
+        core_task = task_with_context[:500]
+
+    for target_file in files:
+        target_path = work_dir / target_file
+
+        # 讀取現有檔案內容
+        if target_path.exists():
+            try:
+                file_content = target_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                file_content = target_path.read_text(encoding="utf-8", errors="replace")
+        else:
+            file_content = ""
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        test_content = _find_test_file_content(work_dir, target_file)
+        print(f"\n[DDI] 處理檔案：{target_file}（{len(file_content.splitlines())} 行）")
+
+        # ── 決定是否需要分解 ────────────────────────────────────
+        use_decompose = should_use_ddi(core_task, file_content, [target_file])
+        print(f"[DDI] 模式：{'DDI分解生成' if use_decompose else '單次生成（簡單任務）'}")
+
+        integrated_code = ""
+        subtasks: list[dict] = []
+
+        if use_decompose:
+            # Stage 1: Decompose
+            print("[DDI] Stage 1: 任務分解...")
+            subtasks = ddi_decompose(core_task, file_content, target_file, test_content)
+
+        if subtasks:
+            # Stage 2: Draft（按依賴順序執行）
+            print(f"[DDI] Stage 2: 逐子任務生成（共 {len(subtasks)} 個）...")
+            completed_drafts: dict[str, str] = {}
+
+            # 拓撲排序：依賴解決後才執行
+            ordered: list[dict] = []
+            remaining = list(subtasks)
+            seen_ids: set[str] = set()
+            for _ in range(len(remaining) * 2 + 1):
+                if not remaining:
+                    break
+                for sub in list(remaining):
+                    if all(d in seen_ids for d in sub.get("dependencies", [])):
+                        ordered.append(sub)
+                        remaining.remove(sub)
+                        seen_ids.add(sub["id"])
+            ordered.extend(remaining)  # 循環依賴或未解的直接加入
+
+            for subtask in ordered:
+                draft = ddi_draft_subtask(subtask, file_content, completed_drafts)
+                if draft:
+                    completed_drafts[subtask["id"]] = draft
+                else:
+                    print(f"[DDI]   {subtask['function_name']}: 草稿空輸出，繼續")
+
+            if completed_drafts:
+                # Stage 3: Integrate
+                print(f"[DDI] Stage 3: Governor 整合（{len(completed_drafts)}/{len(subtasks)} 草稿）...")
+                integrated_code = ddi_integrate(
+                    core_task, file_content, target_file, subtasks, completed_drafts
+                )
+
+                if integrated_code:
+                    # Stage 4: Self-validate
+                    print("[DDI] Stage 4: 自我驗證...")
+                    validation = ddi_self_validate(
+                        core_task, integrated_code, subtasks, test_content
+                    )
+
+                    failing = [
+                        f for f in validation.get("failing_subtasks", [])
+                        if any(s["id"] == f for s in subtasks)
+                    ]
+
+                    # 針對性重試（最多重試 2 個子任務、1 輪）
+                    if not validation.get("pass") and failing:
+                        issues_hint = " | ".join(
+                            str(i) for i in validation.get("issues", [])[:3]
+                        )
+                        print(f"[DDI] 驗證未通過，針對性重試 {len(failing[:2])} 個子任務...")
+
+                        for retry_id in failing[:2]:
+                            retry_sub = next(
+                                (s for s in subtasks if s["id"] == retry_id), None
+                            )
+                            if retry_sub:
+                                new_draft = ddi_draft_subtask(
+                                    retry_sub,
+                                    integrated_code,   # 用整合後的程式碼作為 context
+                                    {k: v for k, v in completed_drafts.items()
+                                     if k != retry_id},
+                                    extra_hint=issues_hint[:100],
+                                )
+                                if new_draft:
+                                    completed_drafts[retry_id] = new_draft
+
+                        # 重新整合（含修正後草稿）
+                        print("[DDI] 重新整合（含修正版草稿）...")
+                        integrated_code = ddi_integrate(
+                            core_task, file_content, target_file, subtasks, completed_drafts
+                        )
+            else:
+                print("[DDI] Stage 2 全部空輸出，降級為單次生成")
+
+        # Fallback：subtasks 為空 或 整合失敗
+        if not integrated_code:
+            reason = "分解 fallback" if subtasks else "簡單任務"
+            print(f"[DDI] 單次生成（{reason}）...")
+            integrated_code = _single_shot_generate(
+                core_task, file_content, target_file, normalized_model
+            )
+
+        # ── 寫入目標檔案 ────────────────────────────────────────
+        if integrated_code and integrated_code.strip():
+            if integrated_code.strip() != file_content.strip():
+                target_path.write_text(integrated_code, encoding="utf-8")
+                lines = len(integrated_code.splitlines())
+                print(f"[DDI] 已寫入 {target_file}（{lines} 行）")
+                output_log.append(
+                    f"[DDI] {target_file}: 已更新（{len(subtasks)} 個子任務，{lines} 行）"
+                )
+                any_changed = True
+            else:
+                print(f"[DDI] {target_file}: 無差異，未寫入")
+                output_log.append(f"[DDI] {target_file}: 無差異")
+        else:
+            print(f"[DDI] {target_file}: 無法生成有效程式碼")
+            output_log.append(f"[DDI] {target_file}: 生成失敗")
+
+    full_output = "\n".join(output_log) if output_log else "[DDI] 完成（無輸出）"
+    # task_complete 永遠 False：harness 結果是唯一成敗判準
+    return full_output, False
+
+
 def run_aider(
     task_with_context: str,
     files: list[str],
@@ -531,16 +1305,67 @@ def run_aider(
         print("[Aider] DRY RUN，略過實際執行")
         return "[DRY RUN]", False
 
-    file_args = " ".join(f'"{f}"' for f in files) if files else ""
-    message   = task_with_context.replace('"', '\\"')
+    def normalize_aider_model(raw_model: str) -> str:
+        """
+        GovernorOS 執行期只使用本地 Aider 模型。
+        歷史上保留下來的 claude/openai 名稱只作訓練監督標記，不應在 runtime 觸發 API 呼叫。
+        """
+        model_name = (raw_model or "").strip()
+        if not model_name or "/" in model_name:
+            return model_name or AIDER_MODEL_LOCAL
+
+        anthropic_prefixes = (
+            "claude-",
+            "sonnet",
+            "haiku",
+            "opus",
+        )
+        openai_prefixes = (
+            "gpt-",
+            "o1",
+            "o3",
+            "o4",
+        )
+        gemini_prefixes = ("gemini",)
+        deepseek_prefixes = ("deepseek",)
+
+        lowered = model_name.lower()
+        if (
+            lowered.startswith(anthropic_prefixes)
+            or lowered.startswith(openai_prefixes)
+            or lowered.startswith(gemini_prefixes)
+            or lowered.startswith(deepseek_prefixes)
+        ):
+            print(
+                f"[Aider] runtime 偵測到雲端模型標記 {model_name}，"
+                f"自動改用本地模型 {AIDER_MODEL_LOCAL}"
+            )
+            return AIDER_MODEL_LOCAL
+        return model_name
+
+    normalized_model = normalize_aider_model(model)
+
+    # 所有本地 ollama 模型統一走 DDI Pipeline（移除外部 aider binary 依賴）
+    if normalized_model.startswith("ollama/"):
+        return run_local_ollama_ddi(task_with_context, files, work_dir, normalized_model)
+
+    # ── 非 ollama 模型（保留 aider binary 路徑，作為雲端模型後備）──
+    weak_model = ""
+    if normalized_model.startswith("ollama/"):
+        weak_model = normalized_model
+
+    file_args = " ".join(shlex.quote(f) for f in files) if files else ""
+    message = shlex.quote(task_with_context)
+    weak_model_arg = f"--weak-model {shlex.quote(weak_model)} " if weak_model else ""
 
     cmd = (
         f'"{AIDER_BIN}" --yes-always --no-auto-commits '
         f'--no-detect-urls --no-auto-lint --map-tokens 0 '
         f'--no-browser --no-show-model-warnings '
-        f'--model {model} '
+        f'--model {shlex.quote(normalized_model)} '
+        f'{weak_model_arg}'
         f'{file_args} '
-        f'--message "{message}"'
+        f'--message {message}'
     )
 
     print(f"[Aider] 執行指令：{cmd[:140]}...")
@@ -701,6 +1526,9 @@ Harness 失敗輸出（最後部分）：
 
 def dc(args: list[str]) -> None:
     """呼叫 dream_cycle.py 的快捷函式"""
+    if FAST_MODE and any(flag in args for flag in ("--update-mempalace", "--bridge")):
+        print(f"[DreamCycle] fast mode skip: {' '.join(args[:2])}")
+        return
     subprocess.run(
         [sys.executable, str(DREAM_CYCLE)] + args,
         cwd=BASE_DIR,
@@ -793,6 +1621,47 @@ def update_mempalace(context: str):
 
 def bridge_to_l3(context: str):
     dc(["--bridge", f"--context={context[:2000]}"])
+
+
+def recall_past_failures(task: str, similarity_threshold: float = 0.3) -> str:
+    """
+    呼叫 dream_cycle.py --recall 取得類似過去失敗案例，
+    若有結果且相似度 > threshold，回傳記憶回溯文字；否則回傳空字串。
+    FAST_MODE 下略過（避免拖慢 benchmark）。
+    """
+    if FAST_MODE:
+        return ""
+    try:
+        result = subprocess.run(
+            [sys.executable, str(DREAM_CYCLE), "--recall", f"--task={task[:200]}"],
+            cwd=BASE_DIR,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return ""
+        records = json.loads(result.stdout.strip())
+        if not isinstance(records, list):
+            return ""
+        # 只保留失敗且相似度 > threshold 的案例
+        failures = [
+            r for r in records
+            if not r.get("harness_pass", True)
+            and float(r.get("similarity", 0)) > similarity_threshold
+        ]
+        if not failures:
+            return ""
+        lines = ["[記憶回溯] 類似任務的過去失敗案例："]
+        for r in failures:
+            task_excerpt = r.get("task", "")[:60]
+            failure_mode = r.get("failure_mode", "")
+            root_cause = r.get("root_cause", "")
+            lines.append(f"- {task_excerpt}: {failure_mode} → {root_cause}")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[Recall] 略過（{e}）")
+        return ""
 
 
 def record_diff_intel(
@@ -903,6 +1772,16 @@ def main_loop(
     prev_score = baseline_score
     final_harness_pass = base_pass
     print(f"[Loop] Baseline score={baseline_score:.2f}  pass={base_pass}")
+    base_task_type = infer_task_type(task, harness_cmd, aider_files)
+    base_complexity = infer_task_complexity(task, aider_files, max_iter)
+    base_file_plan = build_file_plan(task, aider_files, base_task_type)
+    task_batches = build_task_batches(aider_files, base_file_plan, base_complexity)
+    if len(task_batches) > 1:
+        batch_summary = " | ".join(
+            f"{batch['label']}={','.join(batch['files'])}"
+            for batch in task_batches
+        )
+        print(f"[TaskSplit] 啟動分段策略：{batch_summary}")
     save_trace_artifacts(
         run_trace_dir,
         iteration=0,
@@ -996,17 +1875,25 @@ def main_loop(
             l2_path.read_text(encoding="utf-8")[:800]
             if l2_path.exists() else ""
         )
-        selected_l4, selected_l5 = select_relevant_memories(task, aider_files)
+        active_files, active_label = select_iteration_files(iteration, task_batches, aider_files)
+        print(f"[TaskSplit] 本輪範圍：{active_label} -> {', '.join(active_files) if active_files else '(auto)'}")
+        selected_l4, selected_l5 = select_relevant_memories(task, active_files)
+        # ── Total Recall：注入過去相似失敗案例 ────────────
+        recall_context = recall_past_failures(task) if iteration == 1 else ""
+        if recall_context:
+            print(f"[Recall] 找到相似失敗案例，已注入 context")
         workflow_plan = build_workflow_plan(
             task,
             harness_cmd,
-            aider_files,
+            active_files,
             max_iter,
             sm.consecutive_fails,
             research_brief,
             last_harness_output,
             selected_l4,
             selected_l5,
+            active_files,
+            active_label,
         )
         l4_section = format_memory_section(
             "[Relevant L4]",
@@ -1025,30 +1912,49 @@ def main_loop(
                 f"（避免：{item.get('avoid', '')}）"
             ),
         )
-        aider_message = (
-            f"[ITER {iteration}/{max_iter}] 任務：{task}\n"
-            + (
-                f"\n[Workflow Plan]\n"
-                f"- task_type={workflow_plan['task_type']}\n"
-                f"- complexity={workflow_plan['complexity']}\n"
-                f"- mode={workflow_plan['execution_mode']}\n"
-                f"- goal={workflow_plan['parsed_task']['goal']}\n"
-                f"- constraints={'; '.join(workflow_plan['parsed_task']['constraints']) or '(none)'}\n"
-                f"- acceptance={'; '.join(workflow_plan['parsed_task']['acceptance']) or '(none)'}\n"
-                f"- file_plan={summarize_file_plan(workflow_plan['file_plan']) or '(none)'}\n"
-                if workflow_plan else ""
+        is_local_qwen_aider = AIDER_MODEL_LOCAL.startswith("ollama/qwen3.5")
+        if is_local_qwen_aider:
+            compact_failure = sanitize_cli_text(last_harness_output[-700:], 700)
+            compact_research = sanitize_cli_text(research_brief, 220)
+            aider_message = (
+                f"[ITER {iteration}/{max_iter}] 任務：{workflow_plan['parsed_task']['goal']}\n"
+                f"本輪範圍：{workflow_plan['active_label']} -> {', '.join(workflow_plan['active_files']) or '(none)'}\n"
+                f"驗收：{'; '.join(workflow_plan['parsed_task']['acceptance']) or harness_cmd}\n"
+                + (f"{recall_context}\n" if recall_context else "")
+                + (f"研究提示：{compact_research}\n" if compact_research else "")
+                + (f"當前失敗：{compact_failure}\n" if compact_failure else "")
+                + "直接修改提供的檔案。\n"
+                + "不要輸出說明、不要輸出步驟、不要輸出 markdown 標題、不要輸出 code fence。\n"
+                + "只輸出 Aider 可套用的 whole-file 修改內容；未完成時不要輸出 TASK_COMPLETE。\n"
             )
-            + (f"\n[Research Brief]\n{research_brief}\n" if research_brief else "")
-            + (f"\n[MemPalace]\n{mempalace}\n" if mempalace else "")
-            + (f"\n{l4_section}\n" if l4_section else "")
-            + (f"\n{l5_section}\n" if l5_section else "")
-            + (f"\n[上次 Harness 失敗]\n{last_harness_output[-600:]}\n"
-               if last_harness_output and sm.consecutive_fails > 0 else "")
-        )
+        else:
+            aider_message = (
+                f"[ITER {iteration}/{max_iter}] 任務：{task}\n"
+                + (f"\n{recall_context}\n" if recall_context else "")
+                + (
+                    f"\n[Workflow Plan]\n"
+                    f"- task_type={workflow_plan['task_type']}\n"
+                    f"- complexity={workflow_plan['complexity']}\n"
+                    f"- mode={workflow_plan['execution_mode']}\n"
+                    f"- goal={workflow_plan['parsed_task']['goal']}\n"
+                    f"- active_scope={workflow_plan['active_label']}\n"
+                    f"- active_files={', '.join(workflow_plan['active_files']) or '(none)'}\n"
+                    f"- constraints={'; '.join(workflow_plan['parsed_task']['constraints']) or '(none)'}\n"
+                    f"- acceptance={'; '.join(workflow_plan['parsed_task']['acceptance']) or '(none)'}\n"
+                    f"- file_plan={summarize_file_plan(workflow_plan['file_plan']) or '(none)'}\n"
+                    if workflow_plan else ""
+                )
+                + (f"\n[Research Brief]\n{research_brief}\n" if research_brief else "")
+                + (f"\n[MemPalace]\n{mempalace}\n" if mempalace else "")
+                + (f"\n{l4_section}\n" if l4_section else "")
+                + (f"\n{l5_section}\n" if l5_section else "")
+                + (f"\n[上次 Harness 失敗]\n{last_harness_output[-600:]}\n"
+                   if last_harness_output and sm.consecutive_fails > 0 else "")
+            )
 
         # ── Aider 執行 ────────────────────────────
         aider_out, task_complete = run_aider(
-            aider_message, aider_files, work_dir, aider_model, dry_run
+            aider_message, active_files, work_dir, aider_model, dry_run
         )
 
         # ── Git Diff ──────────────────────────────
@@ -1060,7 +1966,7 @@ def main_loop(
             if line.strip()
         )[:600]
         patch_summary = f"{diff_summary}; diff_excerpt={diff_excerpt or '(empty diff)'}"
-        candidate_files = changed_files or aider_files
+        candidate_files = changed_files or active_files or aider_files
 
         # ── Snapshot（Harness 前建立，rollback 精確點）─
         snapshot_tag = git_snapshot(work_dir, iteration)
@@ -1316,7 +2222,7 @@ def main():
     )
     parser.add_argument("--task",         required=True,  help="任務描述")
     parser.add_argument("--harness",      required=True,  help="驗證指令，e.g. 'pytest tests/'")
-    parser.add_argument("--aider-model",  default="claude-3-5-sonnet-20241022",
+    parser.add_argument("--aider-model",  default=AIDER_MODEL_LOCAL,
                         help="Aider 使用的 LLM 模型")
     parser.add_argument("--aider-files",  default="",
                         help="Aider 要編輯的檔案（空格分隔）")
@@ -1327,7 +2233,7 @@ def main():
     parser.add_argument("--ollama-governor",    default=OLLAMA_MODEL_GOVERNOR,
                         help="Governor 模型（狀態機 / MemPalace，預設 qwen3.5:27b）")
     parser.add_argument("--ollama-researcher",  default=OLLAMA_MODEL_RESEARCHER,
-                        help="Researcher 模型（Autoresearch，預設 qwen2.5:7b）")
+                        help="Researcher 模型（DDI 分解/草稿/自我驗證，預設 qwen3.5:9b）")
     parser.add_argument("--dry-run",      action="store_true",
                         help="不實際執行 Aider（測試用）")
 

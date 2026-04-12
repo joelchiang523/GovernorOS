@@ -45,6 +45,44 @@ echo_header() {
 cmd_morning() {
     echo_header "Morning Startup"
 
+    # ── P4：若距上次 --sleep 超過 24 小時，自動執行 ──────────────
+    LAST_DREAM_FILE="$SCRIPT_DIR/memory/last_dream.json"
+    SHOULD_SLEEP=0
+    if [ ! -f "$LAST_DREAM_FILE" ]; then
+        SHOULD_SLEEP=1
+    else
+        LAST_SLEEP_TS=$($PYTHON -c "
+import json, sys
+from datetime import datetime
+try:
+    data = json.load(open('$LAST_DREAM_FILE'))
+    last = datetime.fromisoformat(data.get('last_sleep', '2000-01-01T00:00:00'))
+    age = (datetime.now() - last).total_seconds()
+    print('old' if age > 86400 else 'recent')
+except Exception:
+    print('old')
+" 2>/dev/null || echo "old")
+        if [ "$LAST_SLEEP_TS" = "old" ]; then
+            SHOULD_SLEEP=1
+        fi
+    fi
+
+    if [ "$SHOULD_SLEEP" = "1" ]; then
+        echo ""
+        echo "[0/4] 距上次 --sleep 已超過 24 小時，自動執行 DreamCycle --sleep..."
+        $DC --sleep
+        $PYTHON -c "
+import json, sys
+from datetime import datetime
+from pathlib import Path
+p = Path('$LAST_DREAM_FILE')
+p.parent.mkdir(parents=True, exist_ok=True)
+data = json.loads(p.read_text()) if p.exists() else {}
+data['last_sleep'] = datetime.now().isoformat()
+p.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+" 2>/dev/null || true
+    fi
+
     echo ""
     echo "[1/4] Memory Decay Check..."
     $DC --decay
@@ -75,6 +113,18 @@ cmd_evening() {
     echo ""
     echo "[1/4] DreamCycle --sleep（L3 → L4）..."
     $DC --sleep
+    # 記錄 last_sleep 時間
+    LAST_DREAM_FILE="$SCRIPT_DIR/memory/last_dream.json"
+    $PYTHON -c "
+import json, sys
+from datetime import datetime
+from pathlib import Path
+p = Path('$LAST_DREAM_FILE')
+p.parent.mkdir(parents=True, exist_ok=True)
+data = json.loads(p.read_text()) if p.exists() else {}
+data['last_sleep'] = datetime.now().isoformat()
+p.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+" 2>/dev/null || true
 
     echo ""
     echo "[2/4] DreamCycle --deep（L4 → L5）..."

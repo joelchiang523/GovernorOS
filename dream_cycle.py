@@ -451,6 +451,127 @@ def cmd_score_strategies() -> None:
 
 
 # ─────────────────────────────────────────────
+# --recall：TF-IDF 回憶相似過去 episodes
+# ─────────────────────────────────────────────
+
+def _tfidf_tokenize(text: str) -> list[str]:
+    """簡單分詞：lowercase，以非英數字元分割，去除空 token"""
+    return [t for t in re.split(r'[^\w]+', text.lower()) if t]
+
+
+def _build_tfidf(corpus: list[str]) -> tuple[list[dict], dict]:
+    """
+    計算 TF-IDF 向量。
+    回傳 (tf_idf_vectors, idf_dict)。
+    每個向量為 {term: tfidf_weight} dict。
+    """
+    import math
+    from collections import Counter
+
+    N = len(corpus)
+    if N == 0:
+        return [], {}
+
+    tokenized = [_tfidf_tokenize(doc) for doc in corpus]
+    df: dict[str, int] = {}
+    for tokens in tokenized:
+        for term in set(tokens):
+            df[term] = df.get(term, 0) + 1
+
+    idf: dict[str, float] = {
+        term: math.log((N + 1) / (count + 1)) + 1.0
+        for term, count in df.items()
+    }
+
+    vectors: list[dict[str, float]] = []
+    for tokens in tokenized:
+        tf = Counter(tokens)
+        total = len(tokens) or 1
+        vec = {term: (count / total) * idf.get(term, 1.0) for term, count in tf.items()}
+        vectors.append(vec)
+
+    return vectors, idf
+
+
+def _cosine_similarity(vec_a: dict, vec_b: dict) -> float:
+    """計算兩個稀疏向量的 cosine similarity"""
+    import math
+    common_terms = set(vec_a.keys()) & set(vec_b.keys())
+    if not common_terms:
+        return 0.0
+    dot = sum(vec_a[t] * vec_b[t] for t in common_terms)
+    norm_a = math.sqrt(sum(v * v for v in vec_a.values()))
+    norm_b = math.sqrt(sum(v * v for v in vec_b.values()))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _tfidf_query_vector(query_tokens: list[str], idf: dict[str, float]) -> dict[str, float]:
+    """以語料庫的 IDF 計算查詢向量"""
+    from collections import Counter
+    tf = Counter(query_tokens)
+    total = len(query_tokens) or 1
+    return {term: (count / total) * idf.get(term, 1.0) for term, count in tf.items()}
+
+
+def cmd_recall(task: str, top_k: int = 3) -> None:
+    """
+    讀取所有 L3 episodes（validated + candidate），
+    用 TF-IDF cosine similarity 找出最相似的 top_k 筆，
+    輸出 JSON 陣列到 stdout。
+    """
+    # 讀取 validated pool（主 jsonl）
+    episodes: list[dict] = load_jsonl(PATHS["L3"])
+
+    # 也嘗試讀取 candidate pool（若存在單獨檔案）
+    candidate_path = MEMORY_DIR / "l3_episodes_candidate.jsonl"
+    validated_path = MEMORY_DIR / "l3_episodes_validated.jsonl"
+    for extra_path in [candidate_path, validated_path]:
+        if extra_path.exists():
+            episodes.extend(load_jsonl(extra_path))
+
+    if not episodes:
+        print(json.dumps([], ensure_ascii=False))
+        return
+
+    # 建立語料庫（以 task 欄位為主，加上 diff_summary）
+    corpus_texts = [
+        ep.get("task", "") + " " + ep.get("diff_summary", "")
+        for ep in episodes
+    ]
+
+    vectors, idf = _build_tfidf(corpus_texts)
+    query_tokens = _tfidf_tokenize(task)
+    query_vec = _tfidf_query_vector(query_tokens, idf)
+
+    # 計算相似度
+    scored: list[tuple[float, int]] = []
+    for idx, vec in enumerate(vectors):
+        sim = _cosine_similarity(query_vec, vec)
+        scored.append((sim, idx))
+
+    scored.sort(key=lambda x: -x[0])
+    top_results = scored[:top_k]
+
+    output = []
+    for sim, idx in top_results:
+        ep = episodes[idx]
+        taxonomy = ep.get("taxonomy", {})
+        output.append({
+            "episode_id": ep.get("id", ""),
+            "task": ep.get("task", ""),
+            "similarity": round(sim, 4),
+            "harness_pass": ep.get("status", 1) == 0,
+            "failure_mode": taxonomy.get("failure_mode", ep.get("taxonomy", {}).get("failure_mode", "")),
+            "root_cause": taxonomy.get("root_cause", ep.get("taxonomy", {}).get("root_cause", "")),
+            "diff_summary": ep.get("diff_summary", ""),
+        })
+
+    print(json.dumps(output, ensure_ascii=False))
+
+
+# ─────────────────────────────────────────────
 # --init
 # ─────────────────────────────────────────────
 
@@ -979,7 +1100,8 @@ def cmd_sleep():
             new_items = reviewed
             print(f"[Sleep] Phase 2 完成：{len(candidates)} 候選 → {len(new_items)} 通過複核")
 
-    now = datetime.now().strftime("%Y-%m-%d")
+    now_iso = datetime.now().isoformat()
+    now_date = datetime.now().strftime("%Y-%m-%d")
     added = 0
     for item in new_items:
         if not item.get("pattern"):
@@ -991,9 +1113,11 @@ def cmd_sleep():
             "evidence_count": item.get("evidence_count", len(high_priority)),
             "confidence": min(float(item.get("confidence", 0.65)), 0.75),
             "source_episodes": item.get("source_episodes", []),
-            "last_verified": now,
+            "last_verified": now_date,
             "decay_timer": THRESHOLDS["decay_days"],
             "status": "active",
+            "created_at": now_iso,
+            "updated_at": now_iso,
         }
         l4_current.append(record)
         added += 1
@@ -1068,10 +1192,67 @@ def resolve_conflict(existing: dict, challenger: dict) -> tuple[dict, dict, str]
 # --deep：L4 → L5 策略固化
 # ─────────────────────────────────────────────
 
+def _deduplicate_l4(l4_items: list[dict]) -> list[dict]:
+    """
+    對 L4 項目做 TF-IDF 去重合併。
+    若兩條的 summary（pattern + scope）相似度 > 0.75，
+    保留 confidence 較高者，合併 source_episodes，更新 updated_at。
+    回傳去重後的列表。
+    """
+    active = [item for item in l4_items if item.get("status") == "active"]
+    inactive = [item for item in l4_items if item.get("status") != "active"]
+
+    if len(active) < 2:
+        return l4_items
+
+    summaries = [item.get("pattern", "") + " " + item.get("scope", "") for item in active]
+    vectors, idf = _build_tfidf(summaries)
+
+    merged_indices: set[int] = set()  # 被合併掉（刪除）的索引
+    now_iso = datetime.now().isoformat()
+
+    for i in range(len(active)):
+        if i in merged_indices:
+            continue
+        for j in range(i + 1, len(active)):
+            if j in merged_indices:
+                continue
+            sim = _cosine_similarity(vectors[i], vectors[j])
+            if sim > 0.75:
+                # 決定誰保留（confidence 較高者）
+                item_i = active[i]
+                item_j = active[j]
+                if float(item_j.get("confidence", 0)) > float(item_i.get("confidence", 0)):
+                    kept, removed, kept_idx, removed_idx = item_j, item_i, j, i
+                else:
+                    kept, removed, kept_idx, removed_idx = item_i, item_j, i, j
+
+                # 合併 source_episodes
+                merged_episodes = list(set(
+                    kept.get("source_episodes", []) + removed.get("source_episodes", [])
+                ))
+                kept["source_episodes"] = merged_episodes
+                kept["updated_at"] = now_iso
+                merged_indices.add(removed_idx)
+                print(f"[L4] 去重合併：{removed['id']} + {kept['id']} → {kept['id']}")
+
+    deduplicated = [item for idx, item in enumerate(active) if idx not in merged_indices]
+    return deduplicated + inactive
+
+
 def cmd_deep():
     print("[Deep] 開始深眠固化（L4 → L5）...")
 
     l4_all = load_json(PATHS["L4"])
+
+    # ── P3：L4 去重合併 ──────────────────────────────────
+    l4_before = len([k for k in l4_all if k.get("status") == "active"])
+    l4_all = _deduplicate_l4(l4_all)
+    l4_after = len([k for k in l4_all if k.get("status") == "active"])
+    if l4_before != l4_after:
+        save_json(PATHS["L4"], l4_all)
+        print(f"[Deep] 去重完成：{l4_before} → {l4_after} 條 active L4")
+
     qualified = [
         k for k in l4_all
         if k.get("status") == "active"
@@ -1255,7 +1436,7 @@ def cmd_deep():
 def cmd_decay():
     print("[Decay] 執行記憶衰減檢查...")
     now = datetime.now()
-    decay_report = {"l4_decayed": [], "l4_inactive": [], "l5_decayed": [], "l5_downgraded": [], "l5_retired": []}
+    decay_report = {"l4_decayed": [], "l4_inactive": [], "l4_retired": [], "l5_decayed": [], "l5_downgraded": [], "l5_retired": []}
 
     # L4 衰減
     l4 = load_json(PATHS["L4"])
@@ -1266,7 +1447,7 @@ def cmd_decay():
                 days_inactive = (now - last).days
                 if days_inactive >= THRESHOLDS["retire_days"]:
                     item["status"] = "retired"
-                    decay_report["l5_retired"].append(item["id"])
+                    decay_report["l4_retired"].append(item["id"])
                     print(f"  [L4] {item['id']} → retired（{days_inactive}天未驗證）")
             continue
 
@@ -1284,6 +1465,21 @@ def cmd_decay():
             item["confidence"] = max(0.0, round(old_conf - THRESHOLDS["decay_amount"] * weeks_over, 3))
             decay_report["l4_decayed"].append(item["id"])
             print(f"  [L4] {item['id']} confidence {old_conf:.2f} → {item['confidence']:.2f}")
+
+        # P3：timeline-based extra decay（> 30 天未 updated_at）
+        updated_at_str = item.get("updated_at", "")
+        if updated_at_str:
+            try:
+                updated_at = datetime.fromisoformat(updated_at_str)
+                days_since_update = (now - updated_at).days
+                if days_since_update > 30:
+                    old_conf = item.get("confidence", 0.7)
+                    new_conf = max(0.0, round(old_conf * 0.95, 3))
+                    if new_conf != old_conf:
+                        item["confidence"] = new_conf
+                        print(f"  [L4] 時間衰減：{item['id']} age={days_since_update}d conf {old_conf:.2f}→{new_conf:.2f}")
+            except ValueError:
+                pass
 
         if item.get("confidence", 1.0) < THRESHOLDS["inactive_threshold"]:
             item["status"] = "inactive"
@@ -1615,6 +1811,15 @@ def cmd_bridge(mempalace_output: str = ""):
     if result.get("L5_candidates"):
         print(f"[Bridge] L5 候選 {len(result['L5_candidates'])} 條（等待 --deep 升級）")
 
+    # ── P4：AutoDream — 每 10 個 validated episodes 自動觸發 --sleep ──
+    fast_mode = os.environ.get("GOVERNOR_FAST_MODE", "0") == "1"
+    if not fast_mode:
+        all_episodes = load_jsonl(PATHS["L3"])
+        validated_count = sum(1 for e in all_episodes if e.get("pool") == "validated")
+        if validated_count > 0 and validated_count % 10 == 0:
+            print(f"[AutoDream] 已累積 {validated_count} episodes，自動觸發 --sleep")
+            cmd_sleep()
+
 
 # ─────────────────────────────────────────────
 # --status：顯示記憶系統狀態
@@ -1720,6 +1925,7 @@ def main():
     parser.add_argument("--status",           action="store_true", help="顯示記憶系統狀態")
     parser.add_argument("--export-training-data", action="store_true", help="匯出 decision-SFT 訓練樣本")
     parser.add_argument("--score-strategies", action="store_true", help="依 effectiveness 調整 L4/L5 confidence")
+    parser.add_argument("--recall",           action="store_true", help="TF-IDF 回憶相似過去 episodes（需 --task）")
 
     # --record 參數
     parser.add_argument("--status-code",   type=int,   default=0,   dest="status_code")
@@ -1834,6 +2040,8 @@ def main():
         )
     elif args.score_strategies:
         cmd_score_strategies()
+    elif args.recall:
+        cmd_recall(task=args.task)
     else:
         parser.print_help()
 

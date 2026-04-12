@@ -2,8 +2,8 @@
 # run_training.sh — 完整系統層訓練流程
 #
 # 使用方式：
-#   ./run_training.sh                        # 標準訓練（qwen2.5-coder:14b）
-#   ./run_training.sh --model qwen2.5-coder:32b
+#   ./run_training.sh                        # 標準訓練（qwen3.5:9b）
+#   ./run_training.sh --model ollama/qwen3.5:27b
 #   ./run_training.sh --dry-run              # 不實際呼叫 ollama，測試流程
 #   ./run_training.sh --skip-morning         # 略過 morning startup
 #
@@ -34,7 +34,7 @@ RESET_SCRIPT="$SCRIPT_DIR/benchmarks/reset_tasks.sh"
 REPORT_DIR="$SCRIPT_DIR/benchmark_reports"
 
 # ── 參數解析 ────────────────────────────────────────────
-MODEL="ollama/qwen2.5-coder:14b"
+MODEL="ollama/qwen3.5:9b"
 DRY_RUN=""
 SKIP_MORNING=false
 SKIP_EVENING=false

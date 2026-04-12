@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -27,6 +28,7 @@ BENCHMARK_RUNNER = BASE_DIR / "benchmark_runner.py"
 DREAM_CYCLE = BASE_DIR / "dream_cycle.py"
 STARTUP = BASE_DIR / "startup.sh"
 DEFAULT_RUN_ROOT = BASE_DIR / "training_runs"
+DEFAULT_AIDER_MODEL = os.environ.get("OLLAMA_MODEL_AIDER", "ollama/qwen3.5:9b")
 
 
 def ensure_dir(path: Path) -> Path:
@@ -71,7 +73,7 @@ def load_task_queue(path: Path) -> list[dict]:
         normalized["aider_files"] = item.get("aider_files", [])
         normalized["max_iter"] = int(item.get("max_iter", 8))
         normalized["score_pattern"] = item.get("score_pattern", "")
-        normalized["aider_model"] = item.get("aider_model", "claude-3-5-sonnet-20241022")
+        normalized["aider_model"] = item.get("aider_model", DEFAULT_AIDER_MODEL)
         validated.append(normalized)
     return validated
 
@@ -143,7 +145,7 @@ def build_main_loop_cmd(task: dict, dry_run: bool) -> list[str]:
         "--max-iter",
         str(task.get("max_iter", 8)),
         "--aider-model",
-        task.get("aider_model", "claude-3-5-sonnet-20241022"),
+        task.get("aider_model", DEFAULT_AIDER_MODEL),
     ]
     aider_files = task.get("aider_files", [])
     if aider_files:

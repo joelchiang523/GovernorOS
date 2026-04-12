@@ -15,7 +15,7 @@ if [ -z "${PYTHON:-}" ]; then
 fi
 LOCK="$SCRIPT_DIR/memory/.auto_train.lock"
 LOG="$SCRIPT_DIR/memory/auto_train.log"
-MODEL="${OLLAMA_MODEL_AIDER:-ollama/qwen2.5-coder:14b}"
+MODEL="${OLLAMA_MODEL_AIDER:-ollama/qwen3.5:9b}"
 
 export OLLAMA_NO_CLOUD=1
 export BROWSER=""

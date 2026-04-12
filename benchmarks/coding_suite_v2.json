@@ -8,7 +8,7 @@
       "harness": "python3 -m pytest tests/test_sort.py -q",
       "work_dir": "${BENCH_TASKS}/fix_sort",
       "aider_files": ["solution.py"], "max_iter": 6, "score_pattern": "passed",
-      "aider_model": "ollama/qwen2.5-coder:14b"
+      "aider_model": "ollama/qwen3.5:9b"
     },
     {
       "id": "fix_cache",
@@ -16,7 +16,7 @@
       "harness": "python3 -m pytest tests/test_cache.py -q",
       "work_dir": "${BENCH_TASKS}/fix_cache",
       "aider_files": ["solution.py"], "max_iter": 6, "score_pattern": "passed",
-      "aider_model": "ollama/qwen2.5-coder:14b"
+      "aider_model": "ollama/qwen3.5:9b"
     },
     {
       "id": "fix_parser",
@@ -24,7 +24,7 @@
       "harness": "python3 -m pytest tests/test_parser.py -q",
       "work_dir": "${BENCH_TASKS}/fix_parser",
       "aider_files": ["solution.py"], "max_iter": 8, "score_pattern": "passed",
-      "aider_model": "ollama/qwen2.5-coder:14b"
+      "aider_model": "ollama/qwen3.5:9b"
     },
     {
       "id": "fix_graph",
@@ -32,7 +32,7 @@
       "harness": "python3 -m pytest tests/test_graph.py -q",
       "work_dir": "${BENCH_TASKS}/fix_graph",
       "aider_files": ["solution.py"], "max_iter": 6, "score_pattern": "passed",
-      "aider_model": "ollama/qwen2.5-coder:14b"
+      "aider_model": "ollama/qwen3.5:9b"
     },
     {
       "id": "fix_validator",
@@ -40,7 +40,7 @@
       "harness": "python3 -m pytest tests/test_validator.py -q",
       "work_dir": "${BENCH_TASKS}/fix_validator",
       "aider_files": ["solution.py"], "max_iter": 8, "score_pattern": "passed",
-      "aider_model": "ollama/qwen2.5-coder:14b"
+      "aider_model": "ollama/qwen3.5:9b"
     },
     {
       "id": "tree_ops",
@@ -48,7 +48,7 @@
       "harness": "python3 -m pytest tests/test_tree.py -q",
       "work_dir": "${BENCH_TASKS}/tree_ops",
       "aider_files": ["solution.py"], "max_iter": 6, "score_pattern": "passed",
-      "aider_model": "ollama/qwen2.5-coder:14b"
+      "aider_model": "ollama/qwen3.5:9b"
     },
     {
       "id": "dp_problems",
@@ -56,7 +56,7 @@
       "harness": "python3 -m pytest tests/test_dp.py -q",
       "work_dir": "${BENCH_TASKS}/dp_problems",
       "aider_files": ["solution.py"], "max_iter": 10, "score_pattern": "passed",
-      "aider_model": "ollama/qwen2.5-coder:14b"
+      "aider_model": "ollama/qwen3.5:9b"
     },
     {
       "id": "string_ops",
@@ -64,7 +64,7 @@
       "harness": "python3 -m pytest tests/test_string.py -q",
       "work_dir": "${BENCH_TASKS}/string_ops",
       "aider_files": ["solution.py"], "max_iter": 8, "score_pattern": "passed",
-      "aider_model": "ollama/qwen2.5-coder:14b"
+      "aider_model": "ollama/qwen3.5:9b"
     },
     {
       "id": "stack_queue",
@@ -72,7 +72,7 @@
       "harness": "python3 -m pytest tests/test_stack.py -q",
       "work_dir": "${BENCH_TASKS}/stack_queue",
       "aider_files": ["solution.py"], "max_iter": 8, "score_pattern": "passed",
-      "aider_model": "ollama/qwen2.5-coder:14b"
+      "aider_model": "ollama/qwen3.5:9b"
     },
     {
       "id": "task_decomp",
@@ -80,7 +80,7 @@
       "harness": "python3 -m pytest tests/test_decomp.py -q",
       "work_dir": "${BENCH_TASKS}/task_decomp",
       "aider_files": ["solution.py"], "max_iter": 8, "score_pattern": "passed",
-      "aider_model": "ollama/qwen2.5-coder:14b"
+      "aider_model": "ollama/qwen3.5:9b"
     }
   ]
 }
